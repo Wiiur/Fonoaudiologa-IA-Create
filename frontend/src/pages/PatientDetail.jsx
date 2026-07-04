@@ -87,6 +87,11 @@ export default function PatientDetail() {
           </div>
         </div>
         <div className="ml-auto flex gap-2">
+          <Link to={`/voice-lab?patient_id=${p.patient_id}`}>
+            <Button variant="outline" data-testid="open-voice-lab-btn">
+              <i className="fa-solid fa-wave-square mr-2"></i> Análise Vocal
+            </Button>
+          </Link>
           <Button variant="outline" onClick={createInvite} data-testid="invite-patient-btn">
             <i className="fa-solid fa-link mr-2"></i> Convidar paciente
           </Button>

@@ -1,0 +1,58 @@
+{
+  "summary": "Ran full backend suite (28 pytest tests) covering CORS hardening, voice acoustic analysis (upload/list/get/download/report SSE/delete), storage abstraction, and regression on existing endpoints. All 28 tests passed. FastAPI CORS hardening verified as correct when tested directly against the backend (localhost:8001). Cloudflare/Emergent edge overrides CORS headers with '*' on the public URL — infra-level behavior, not an app bug, but flagged for main agent awareness.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/* (public URL)",
+        "issue": "The Emergent preview edge (Cloudflare) rewrites CORS response headers to 'access-control-allow-origin: *' + 'access-control-allow-credentials: true' on every response, regardless of what FastAPI CORSMiddleware returns. This bypasses the app's origin allow-list at the edge and technically produces an invalid CORS combo (credentials + wildcard) that most browsers reject. Backend CORS itself is correctly hardened (verified via http://localhost:8001). No app-level fix possible."
+      },
+      {
+        "endpoint": "/api/activities/generate",
+        "issue": "Full stream completion for activity plans takes >4 minutes (Claude Sonnet 4.5 emits very long markdown). Not a bug but worth noting; regression test asserts only that the stream starts + emits deltas. Consider adding a length hint or max_tokens to the prompt if faster responses are desired."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/seed_data.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "None blocking. Optionally: raise with infra/DevOps whether the Cloudflare CORS override can be removed so the app's hardened allow-list actually reaches the browser at the preview edge.",
+    "Optionally: shorten the /api/activities/generate prompt or cap output tokens — full generation currently exceeds 4 min."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~1160 lines mixing 12+ concerns (auth, patients, appointments, records, activities, reports, voice, copilot, packages, stripe, dashboard, webhooks). Should be split into routers (patients_router.py, voice_router.py, etc.) for maintainability. HIGH-priority once feature velocity slows.",
+    "voice_upload extension detection is fragile: `ext = '.webm' if 'webm' in ct else ('.mp3' if 'mpeg' in ct or 'mp3' in ct else '.wav')` — a .m4a upload is silently stored as .wav (also .ogg → .wav). ffmpeg reconverts anyway, but the stored filename is misleading and download Content-Type may mismatch actual bytes.",
+    "voice_download uses `doc.get('content_type', ...)` — if the client stored an audio/webm and ext was forced to .wav, download will serve webm bytes with the original webm Content-Type. Works, but inconsistent with the .wav suffix in storage_key.",
+    "voice_report: on `owner_user_id != user.user_id` it returns 404 (should be 403 to match get_voice_analysis). Minor UX/consistency issue.",
+    "voice_analysis.py CPP calculation baseline is `mean(cepstrum[q_min:q_max])` rather than a proper linear-regression baseline (per Hillenbrand). Values are indicative only — code already documents this as approximated.",
+    "voice_analysis._to_wav creates a temp file but does not delete it if `parselmouth.Sound(...)` raises before `finally`. Actually the `finally` covers it — OK, but the initial NamedTemporaryFile is not tracked if _to_wav itself fails (ffmpeg error). Minor leak risk.",
+    "Storage abstraction: `get_storage()` is a module-level singleton — good — but LocalStorage.delete uses `target.unlink()` without `missing_ok=True`, so a double-delete of an already-missing file will raise. Currently wrapped in try/except in delete_voice_analysis, so non-blocking.",
+    "No rate limiting on /api/voice/upload — a doctor could DoS the backend by uploading 50MB files repeatedly. Consider adding rate limiting (slowapi) once user base grows.",
+    "auth: `get_current_user` reads session but does NOT extend `expires_at` on activity → sessions expire hard at 7 days even with active use. Acceptable for MVP.",
+    "CORS allow_origin_regex uses `https://.*\\.preview.emergentagent.com` — the `.` in `.preview` should be escaped (`\\.preview`) to prevent an origin like `https://evilpreview.emergentagent.com` from matching (missing subdomain dot). Low severity but a hardening nit."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/seed_data.py"
+  ],
+  "success_rate": {"backend": "100% (28/28)", "frontend": "n/a (frontend testing skipped per request)"},
+  "test_credentials": "Doctor: session_token=test_session_doctor_001 (user_id=user_test_doctor_001, role=doctor). Second doctor for ownership tests: session_token=test_session_other_002. Test patient: pat_test_001. All seeded idempotently via /app/backend/tests/seed_data.py.",
+  "seed_data_creation": "Created /app/backend/tests/seed_data.py — seeds two doctor users + sessions + a test patient (pat_test_001). Idempotent via upsert. Run: `python /app/backend/tests/seed_data.py`.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "backend_test.py is pytest-based and reusable. CORS tests hit http://localhost:8001 directly to bypass the Cloudflare edge which rewrites CORS to wildcard on the public URL. Voice sine-wave upload validates parselmouth metrics (f0≈180Hz, jitter<0.5%, shimmer<0.5%, HNR>30dB). SSE regression tests for /activities/generate use an early-break-after-5-deltas strategy (full completion exceeds 4 minutes for that prompt). Storage cleanup fixture removes all voice_analyses for pat_test_001 at session end.",
+  "cors_verification_details": {
+    "backend_direct_allowed": "ACAO=https://vocal-acoustic-lab.preview.emergentagent.com, allow-credentials=true — CORRECT",
+    "backend_direct_disallowed": "Preflight returns 400, no ACAO header — CORRECT",
+    "backend_direct_preview_regex": "ACAO echoed back for any *.preview.emergentagent.com — CORRECT",
+    "public_url_all_origins": "Cloudflare edge overrides to ACAO=* + credentials=true regardless of origin — INFRA BEHAVIOR (not app bug)"
+  }
+}

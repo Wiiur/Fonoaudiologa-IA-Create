@@ -14,6 +14,7 @@ import Activities from "@/pages/Activities";
 import Prontuario from "@/pages/Prontuario";
 import Reports from "@/pages/Reports";
 import Copilot from "@/pages/Copilot";
+import VoiceLab from "@/pages/VoiceLab";
 import Packages from "@/pages/Packages";
 import CheckoutSuccess from "@/pages/CheckoutSuccess";
 import PatientPortal from "@/pages/PatientPortal";
@@ -68,6 +69,7 @@ const AppRouter = () => {
         <Route path="/prontuario" element={<Prontuario />} />
         <Route path="/reports" element={<Reports />} />
         <Route path="/copilot" element={<Copilot />} />
+        <Route path="/voice-lab" element={<VoiceLab />} />
         <Route path="/packages" element={<Packages />} />
       </Route>
 

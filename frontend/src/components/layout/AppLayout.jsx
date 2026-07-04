@@ -8,6 +8,7 @@ const NAV_DOCTOR = [
   { to: "/agenda", icon: "fa-calendar-days", label: "Agenda" },
   { to: "/activities", icon: "fa-brain", label: "Atividades IA" },
   { to: "/prontuario", icon: "fa-notes-medical", label: "Prontuário" },
+  { to: "/voice-lab", icon: "fa-wave-square", label: "Análise Vocal" },
   { to: "/reports", icon: "fa-file-signature", label: "Relatórios" },
   { to: "/copilot", icon: "fa-microscope", label: "Copiloto" },
   { to: "/packages", icon: "fa-box-open", label: "Pacotes" },

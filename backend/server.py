@@ -1,6 +1,7 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, FileResponse
 import json
+import tempfile
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -17,6 +18,9 @@ from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, Strea
 from emergentintegrations.payments.stripe.checkout import (
     StripeCheckout, CheckoutSessionRequest,
 )
+
+from storage import get_storage
+from voice_analysis import analyze_audio, build_clinical_prompt
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -932,14 +936,218 @@ async def stripe_webhook(request: Request):
     return {"ok": True}
 
 
+# ---------- Voice Analysis (Acoustic + AI Laudo) ----------
+VOICE_ANALYSIS_SYSTEM = (
+    "Você é a VoxIntelligence, especialista em análise vocal instrumental (Praat). "
+    "Gere laudos técnicos, respeitando ética profissional fonoaudiológica e sem diagnóstico médico definitivo."
+)
+
+
+class VoiceAnalysisMeta(BaseModel):
+    patient_id: str
+    task: Literal["sustained_vowel", "reading", "spontaneous"] = "sustained_vowel"
+    notes: Optional[str] = None
+
+
+@api_router.post("/voice/upload")
+async def voice_upload(
+    file: UploadFile = File(...),
+    patient_id: str = Form(...),
+    task: str = Form("sustained_vowel"),
+    notes: Optional[str] = Form(None),
+    user: User = Depends(get_current_user),
+):
+    if user.role != "doctor":
+        raise HTTPException(status_code=403, detail="Only doctor can upload voice recordings")
+
+    pat = await db.patients.find_one({"patient_id": patient_id, "owner_user_id": user.user_id}, {"_id": 0})
+    if not pat:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    allowed_ct = {"audio/wav", "audio/x-wav", "audio/wave", "audio/mpeg", "audio/mp3",
+                  "audio/webm", "audio/ogg", "audio/mp4", "audio/x-m4a", "video/webm"}
+    ct = (file.content_type or "").lower()
+    if ct not in allowed_ct and not (file.filename or "").lower().endswith((".wav", ".mp3", ".webm", ".ogg", ".m4a")):
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format: {ct}")
+
+    data = await file.read()
+    if len(data) < 1024:
+        raise HTTPException(status_code=400, detail="Audio file too small")
+    if len(data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
+
+    analysis_id = f"vox_{uuid.uuid4().hex[:14]}"
+    ext = ".webm" if "webm" in ct else (".mp3" if "mpeg" in ct or "mp3" in ct else ".wav")
+    storage_key = f"voice/{user.user_id}/{patient_id}/{analysis_id}{ext}"
+
+    storage = get_storage()
+    storage.save_bytes(storage_key, data)
+
+    # Run acoustic analysis on the stored file
+    local_path = storage.local_path(storage_key)
+    try:
+        metrics = analyze_audio(local_path)
+    except Exception as e:
+        logger.exception("voice analysis failed")
+        raise HTTPException(status_code=500, detail=f"Acoustic analysis failed: {str(e)[:200]}")
+
+    doc = {
+        "analysis_id": analysis_id,
+        "owner_user_id": user.user_id,
+        "patient_id": patient_id,
+        "patient_name": pat["name"],
+        "task": task,
+        "notes": notes,
+        "storage_key": storage_key,
+        "storage_backend": storage.kind,
+        "content_type": ct or "application/octet-stream",
+        "metrics": metrics,
+        "report": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.voice_analyses.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/voice/analyses")
+async def list_voice_analyses(patient_id: Optional[str] = None, user: User = Depends(get_current_user)):
+    q = {}
+    if user.role == "doctor":
+        q["owner_user_id"] = user.user_id
+    elif user.role == "patient":
+        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
+        q["patient_id"] = {"$in": [p["patient_id"] for p in pats]}
+    else:
+        return []
+    if patient_id:
+        q["patient_id"] = patient_id
+    docs = await db.voice_analyses.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return docs
+
+
+@api_router.get("/voice/analyses/{analysis_id}")
+async def get_voice_analysis(analysis_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404)
+    if user.role == "doctor" and doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=403)
+    return doc
+
+
+@api_router.delete("/voice/analyses/{analysis_id}")
+async def delete_voice_analysis(analysis_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404)
+    if doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=403)
+    try:
+        get_storage().delete(doc["storage_key"])
+    except Exception:
+        pass
+    await db.voice_analyses.delete_one({"analysis_id": analysis_id})
+    return {"ok": True}
+
+
+@api_router.get("/voice/audio/{analysis_id}")
+async def voice_download(analysis_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404)
+    if user.role == "doctor" and doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=403)
+    storage = get_storage()
+    try:
+        data = storage.read_bytes(doc["storage_key"])
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Audio not found in storage")
+    return Response(
+        content=data,
+        media_type=doc.get("content_type", "application/octet-stream"),
+        headers={"Content-Disposition": f'inline; filename="{analysis_id}"'},
+    )
+
+
+@api_router.post("/voice/analyses/{analysis_id}/report")
+async def voice_report(analysis_id: str, user: User = Depends(get_current_user)):
+    if user.role != "doctor":
+        raise HTTPException(status_code=403)
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="LLM key missing")
+
+    doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
+    if not doc or doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=404)
+
+    pat = await db.patients.find_one({"patient_id": doc["patient_id"]}, {"_id": 0})
+    if not pat:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    prompt = build_clinical_prompt(pat, doc.get("metrics") or {}, doc.get("notes") or "")
+
+    chat = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"voice-{analysis_id}",
+        system_message=VOICE_ANALYSIS_SYSTEM,
+    ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+
+    async def event_gen():
+        full = ""
+        try:
+            async for ev in chat.stream_message(UserMessage(text=prompt)):
+                if isinstance(ev, TextDelta):
+                    full += ev.content
+                    yield f"data: {json.dumps({'delta': ev.content})}\n\n"
+                elif isinstance(ev, StreamDone):
+                    break
+            await db.voice_analyses.update_one(
+                {"analysis_id": analysis_id},
+                {"$set": {"report": full, "report_generated_at": datetime.now(timezone.utc).isoformat()}},
+            )
+            yield f"data: {json.dumps({'done': True, 'report': full})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
 app.include_router(api_router)
+
+# ---------- CORS Hardening ----------
+# Origins are read from CORS_ORIGINS env var (comma-separated). Default: locked down
+# to the current preview URL + localhost. No wildcards in production.
+_raw_origins = os.environ.get("CORS_ORIGINS", "").strip()
+if _raw_origins and _raw_origins != "*":
+    _origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+else:
+    _origins = [
+        "https://vocal-acoustic-lab.preview.emergentagent.com",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_origins,
+    allow_origin_regex=r"https://.*\.preview\.emergentagent\.com",
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Session-ID",
+        "Accept",
+        "Origin",
+        "Cache-Control",
+    ],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
