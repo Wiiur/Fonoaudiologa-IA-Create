@@ -1,41 +1,96 @@
-import { useEffect } from "react";
+import React from "react";
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
-import { HOME } from "@/constants/testIds";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider, useAuth } from "@/context/AuthContext";
+import Landing from "@/pages/Landing";
+import AuthCallback from "@/pages/AuthCallback";
+import RoleSelect from "@/pages/RoleSelect";
+import Dashboard from "@/pages/Dashboard";
+import Patients from "@/pages/Patients";
+import PatientDetail from "@/pages/PatientDetail";
+import Agenda from "@/pages/Agenda";
+import Activities from "@/pages/Activities";
+import Prontuario from "@/pages/Prontuario";
+import Reports from "@/pages/Reports";
+import Copilot from "@/pages/Copilot";
+import Packages from "@/pages/Packages";
+import CheckoutSuccess from "@/pages/CheckoutSuccess";
+import PatientPortal from "@/pages/PatientPortal";
+import PortalJoin from "@/pages/PortalJoin";
+import AppLayout from "@/components/layout/AppLayout";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+const Protected = ({ children, roles }) => {
+  const { user, loading } = useAuth();
+  const loc = useLocation();
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-stone-500 text-sm">Carregando…</div>
+      </div>
+    );
+  }
+  if (!user) return <Navigate to="/" state={{ from: loc }} replace />;
+  if (user.role === "unassigned") return <Navigate to="/onboarding" replace />;
+  if (roles && !roles.includes(user.role)) return <Navigate to={homeFor(user.role)} replace />;
+  return children;
+};
 
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
+const homeFor = (role) => {
+  if (role === "patient") return "/portal";
+  return "/dashboard";
+};
 
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
+const AppRouter = () => {
+  const location = useLocation();
+  // CRITICAL: Detect session_id synchronously to prevent race conditions
+  if (typeof window !== "undefined" && window.location.hash?.includes("session_id=")) {
+    return <AuthCallback />;
+  }
   return (
-    <div>
-      <header className="App-header">
-        <a
-          data-testid={HOME.emergentLink}
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
+    <Routes>
+      <Route path="/" element={<Landing />} />
+      <Route path="/onboarding" element={<RoleSelect />} />
+      <Route path="/portal/join" element={<PortalJoin />} />
+
+      <Route
+        element={
+          <Protected roles={["doctor", "secretary"]}>
+            <AppLayout />
+          </Protected>
+        }
+      >
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/patients" element={<Patients />} />
+        <Route path="/patients/:id" element={<PatientDetail />} />
+        <Route path="/agenda" element={<Agenda />} />
+        <Route path="/activities" element={<Activities />} />
+        <Route path="/prontuario" element={<Prontuario />} />
+        <Route path="/reports" element={<Reports />} />
+        <Route path="/copilot" element={<Copilot />} />
+        <Route path="/packages" element={<Packages />} />
+      </Route>
+
+      <Route
+        path="/checkout/success"
+        element={
+          <Protected roles={["doctor"]}>
+            <CheckoutSuccess />
+          </Protected>
+        }
+      />
+
+      <Route
+        path="/portal"
+        element={
+          <Protected roles={["patient"]}>
+            <PatientPortal />
+          </Protected>
+        }
+      />
+
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 };
 
@@ -43,11 +98,10 @@ function App() {
   return (
     <div className="App">
       <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
+        <AuthProvider>
+          <AppRouter />
+          <Toaster position="top-right" richColors closeButton />
+        </AuthProvider>
       </BrowserRouter>
     </div>
   );
