@@ -977,7 +977,20 @@ async def voice_upload(
         raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
 
     analysis_id = f"vox_{uuid.uuid4().hex[:14]}"
-    ext = ".webm" if "webm" in ct else (".mp3" if "mpeg" in ct or "mp3" in ct else ".wav")
+    ext_map = {
+        "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+        "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+        "audio/webm": ".webm", "video/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+    }
+    ext = ext_map.get(ct)
+    if not ext and file.filename:
+        for e in (".wav", ".mp3", ".webm", ".ogg", ".m4a"):
+            if file.filename.lower().endswith(e):
+                ext = e
+                break
+    ext = ext or ".bin"
     storage_key = f"voice/{user.user_id}/{patient_id}/{analysis_id}{ext}"
 
     storage = get_storage()
@@ -1078,8 +1091,10 @@ async def voice_report(analysis_id: str, user: User = Depends(get_current_user))
         raise HTTPException(status_code=500, detail="LLM key missing")
 
     doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
-    if not doc or doc["owner_user_id"] != user.user_id:
+    if not doc:
         raise HTTPException(status_code=404)
+    if doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=403)
 
     pat = await db.patients.find_one({"patient_id": doc["patient_id"]}, {"_id": 0})
     if not pat:
@@ -1136,7 +1151,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=_origins,
-    allow_origin_regex=r"https://.*\.preview\.emergentagent\.com",
+    allow_origin_regex=r"https://[^.]+\.preview\.emergentagent\.com",
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=[
         "Authorization",

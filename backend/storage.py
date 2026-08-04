@@ -45,8 +45,7 @@ class LocalStorage:
 
     def delete(self, key: str) -> None:
         target = self.base_dir / key
-        if target.exists():
-            target.unlink()
+        target.unlink(missing_ok=True)
 
 
 class GCSStorage:

@@ -25,10 +25,8 @@ import numpy as np
 def _to_wav(source_path: str, target_sample_rate: int = 22050) -> str:
     """Convert any audio to mono WAV via ffmpeg. Returns the WAV path."""
     src = Path(source_path)
-    if src.suffix.lower() == ".wav":
-        # Still normalize to mono/16-bit for parselmouth robustness
-        pass
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
     tmp.close()
     cmd = [
         "ffmpeg", "-y",
@@ -36,12 +34,17 @@ def _to_wav(source_path: str, target_sample_rate: int = 22050) -> str:
         "-ar", str(target_sample_rate),
         "-ac", "1",
         "-sample_fmt", "s16",
-        tmp.name,
+        tmp_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, timeout=60)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()[-500:]}")
-    return tmp.name
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            Path(tmp_path).unlink(missing_ok=True)
+            raise RuntimeError(f"ffmpeg conversion failed: {result.stderr.decode()[-500:]}")
+        return tmp_path
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
 
 def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
