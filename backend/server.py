@@ -1151,9 +1151,11 @@ async def voice_challenge_attempt(
     if challenge_type not in CHALLENGE_CATALOG:
         raise HTTPException(status_code=400, detail="Unknown challenge_type")
 
-    pat = await db.patients.find_one({"patient_id": patient_id, "owner_user_id": user.user_id}, {"_id": 0})
+    pat = await db.patients.find_one({"patient_id": patient_id}, {"_id": 0})
     if not pat:
         raise HTTPException(status_code=404, detail="Patient not found")
+    if pat.get("owner_user_id") != user.user_id:
+        raise HTTPException(status_code=403, detail="Not your patient")
 
     data = await file.read()
     if len(data) < 1024:
@@ -1230,7 +1232,7 @@ async def delete_challenge_attempt(attempt_id: str, user: User = Depends(get_cur
     doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404)
-    if doc["owner_user_id"] != user.user_id:
+    if user.role != "doctor" or doc["owner_user_id"] != user.user_id:
         raise HTTPException(status_code=403)
     try:
         get_storage().delete(doc["storage_key"])

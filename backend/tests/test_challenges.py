@@ -139,15 +139,15 @@ class TestAttemptValidation:
         assert r.status_code == 404
 
     def test_non_doctor_forbidden(self, other_api):
-        # other doctor is a doctor but doesn't own pat_test_001 → 404 (Patient not found for owner filter)
+        # other doctor doesn't own pat_test_001 → 403 (explicit ownership check applied)
         r = other_api.post(
             f"{BASE_URL}/api/voice/challenges/attempt",
             files={"file": ("a.wav", _sine_wav(2.0), "audio/wav")},
             data={"patient_id": PATIENT_ID, "challenge_type": "sustained_vowel"},
             timeout=60,
         )
-        # other doctor is still role=doctor, so 404 (patient not owned). This tests ownership isolation.
-        assert r.status_code == 404
+        # role=doctor but not the owner → 403 for ownership isolation
+        assert r.status_code == 403
 
 
 # ============================================================
