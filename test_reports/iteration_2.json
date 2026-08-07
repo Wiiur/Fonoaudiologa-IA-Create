@@ -1,0 +1,53 @@
+{
+  "summary": "Iteration 2 — added new /app/backend/tests/test_challenges.py covering the vocal CHALLENGES module (catalog, attempt creation for all 7 types, validation errors, list/audio/delete with ownership). Re-ran full backend suite: 50/50 tests passed (28 existing regression + 22 new challenge tests). All 7 challenge types exercised: sustained_vowel, mpt (8s sine → mpt_seconds≈8s and grade in {alert,warn}), ddk_pataka, glissando (100→400Hz sweep → range_semitones between 20-26 and f0_min≈100 / f0_max≈400), loudness_range, sz_ratio, reading. Ownership isolation verified with second doctor session. Storage-file deletion confirmed on disk. Regression on CORS + voice/upload + auth + reports SSE still green.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/voice/challenges/attempt (non-owning doctor)",
+        "issue": "When a different doctor posts an attempt for a patient they don't own, the endpoint returns 404 ('Patient not found') because the ownership filter is applied at the Mongo query (owner_user_id + patient_id). Behavior is safe (no data leak) but semantically closer to 403 for role=doctor. Cosmetic only."
+      },
+      {
+        "endpoint": "GET /api/voice/challenges/audio/{attempt_id}",
+        "issue": "For role=patient, ownership is not enforced — a linked patient can access any attempt whose linked_user_id chain resolves. Current filter only blocks role=doctor whose id differs. If patients ever get direct access, add explicit patient-side check. Non-blocking for MVP (patient role currently has no UI for challenges)."
+      },
+      {
+        "endpoint": "DELETE /api/voice/challenges/attempts/{attempt_id}",
+        "issue": "Only checks owner_user_id vs current user; a secretary role would get 403, which is fine, but role check is implicit rather than explicit. Consider `if user.role != 'doctor' or doc['owner_user_id'] != user.user_id: 403` for defense in depth."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_challenges.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/seed_data.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_challenges.xml"
+  ],
+  "action_items": [
+    "None blocking. Optional: return 403 (instead of 404) when non-owner doctor posts a challenge attempt for another doctor's patient, for consistency with voice_analysis delete/report semantics.",
+    "Optional: add explicit `user.role == 'doctor'` check to delete_challenge_attempt and challenge_audio for defense-in-depth (currently only owner_user_id check)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~1300 lines with 13 concerns — the earlier recommendation to split into routers (voice_router.py, challenges_router.py, ...) is more urgent. HIGH.",
+    "voice_analysis.analyze_challenge duplicates ffmpeg conversion logic already in analyze_audio; both call _to_wav independently. If both endpoints hit the same upload later (unlikely), the file gets converted twice. Minor perf note.",
+    "analyze_challenge builds the `evaluation` object via if/elif on challenge_type with copy-pasted grade thresholds — extract to a small `_evaluate_{challenge}` helper table for maintainability. Currently ~150 lines of nested branches.",
+    "sz_ratio implementation assumes the /s/ and /z/ each occupy exactly the first and second half of the recording. That is a strong assumption not stated in the challenge instruction ('Envie os dois áudios (ou um após o outro)'). Consider a silence-based split (parselmouth `To TextGrid (silences)`) for real recordings; current impl is only a rough proxy. Report to product/UX.",
+    "_syllable_count is a simplified peak-picker with hard-coded thresholds (-25 dB / 2 dB dip). Real DDK from a sustained sine returns spurious peaks — noted, and the endpoint returns without crashing per spec. Consider disabling `_syllable_count` when signal has near-zero jitter (i.e., synthetic).",
+    "challenge_audio + delete_challenge_attempt do NOT check `user.role`; they only compare owner_user_id. If a `secretary` role ever gets a session token, they'd get 403 correctly (owner_id doesn't match), but the semantics rely on `owner_user_id` being unique. Add explicit role guard for defense-in-depth.",
+    "CHALLENGE_CATALOG is a module-level dict returned via `list(CHALLENGE_CATALOG.values())` — dict insertion order preserves the 7 items, but if Python semantics ever change this becomes flaky. Consider an explicit ordered list.",
+    "storage.LocalStorage.delete is now confirmed to use `missing_ok=True` (fix from iteration 1 addressed).",
+    "No pagination on /api/voice/challenges/attempts — .to_list(300) hard cap. Fine for MVP, needs pagination once patients have >300 attempts."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_challenges.py"
+  ],
+  "success_rate": {"backend": "100% (50/50)", "frontend": "n/a (skipped per request)"},
+  "test_credentials": "Doctor: Authorization: Bearer test_session_doctor_001 (user_id=user_test_doctor_001). Other doctor for ownership: test_session_other_002. Patient: pat_test_001. Seed via `python /app/backend/tests/seed_data.py` (idempotent).",
+  "seed_data_creation": "Reused /app/backend/tests/seed_data.py from iteration 1 (idempotent upserts). No new seed required.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Two test files now under /app/backend/tests: backend_test.py (iteration 1: CORS + voice_analysis + regression) and test_challenges.py (iteration 2: vocal challenges). Both parallelizable via pytest-xdist LoadScope. Run either individually or `pytest backend/tests/ --junitxml=...`. Sine-wave-based synthetic audio via numpy+wave (see _sine_wav / _sweep_wav helpers). All 7 challenge types verified: MPT 8s → grade in {alert,warn} and mpt_seconds in 7-8.5; Glissando 100→400Hz over 5s → range_semitones 20-26, f0_min 80-130, f0_max 350-450. ffmpeg is present at /usr/bin/ffmpeg.",
+  "rca of the issue": "No bugs found. Two failing test-runs during authoring were due to (a) xdist LoadScope splitting classes across workers so module-level `_created_attempts` list wasn't shared; refactored each ownership/delete/audio test to create its own attempt in-line. (b) `test_list_owner_only` ran on a worker that had no prior attempts yet — added an inline create before assertion. Both are test-side issues, not app issues."
+}

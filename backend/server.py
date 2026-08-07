@@ -20,7 +20,7 @@ from emergentintegrations.payments.stripe.checkout import (
 )
 
 from storage import get_storage
-from voice_analysis import analyze_audio, build_clinical_prompt
+from voice_analysis import analyze_audio, build_clinical_prompt, analyze_challenge, CHALLENGE_CATALOG
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -1129,6 +1129,132 @@ async def voice_report(analysis_id: str, user: User = Depends(get_current_user))
         event_gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+# ---------- Vocal Challenges ----------
+@api_router.get("/voice/challenges/catalog")
+async def voice_challenges_catalog(user: User = Depends(get_current_user)):
+    return list(CHALLENGE_CATALOG.values())
+
+
+@api_router.post("/voice/challenges/attempt")
+async def voice_challenge_attempt(
+    file: UploadFile = File(...),
+    patient_id: str = Form(...),
+    challenge_type: str = Form(...),
+    notes: Optional[str] = Form(None),
+    user: User = Depends(get_current_user),
+):
+    if user.role != "doctor":
+        raise HTTPException(status_code=403)
+    if challenge_type not in CHALLENGE_CATALOG:
+        raise HTTPException(status_code=400, detail="Unknown challenge_type")
+
+    pat = await db.patients.find_one({"patient_id": patient_id, "owner_user_id": user.user_id}, {"_id": 0})
+    if not pat:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    data = await file.read()
+    if len(data) < 1024:
+        raise HTTPException(status_code=400, detail="Audio file too small")
+    if len(data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
+
+    ct = (file.content_type or "").lower()
+    ext_map = {
+        "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+        "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+        "audio/webm": ".webm", "video/webm": ".webm",
+        "audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+    }
+    ext = ext_map.get(ct)
+    if not ext and file.filename:
+        for e in (".wav", ".mp3", ".webm", ".ogg", ".m4a"):
+            if file.filename.lower().endswith(e):
+                ext = e
+                break
+    ext = ext or ".bin"
+
+    attempt_id = f"ch_{uuid.uuid4().hex[:14]}"
+    storage_key = f"challenges/{user.user_id}/{patient_id}/{attempt_id}{ext}"
+    storage = get_storage()
+    storage.save_bytes(storage_key, data)
+
+    try:
+        result = analyze_challenge(storage.local_path(storage_key), challenge_type)
+    except Exception as e:
+        logger.exception("challenge analysis failed")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)[:200]}")
+
+    doc = {
+        "attempt_id": attempt_id,
+        "owner_user_id": user.user_id,
+        "patient_id": patient_id,
+        "patient_name": pat["name"],
+        "challenge_type": challenge_type,
+        "challenge_title": CHALLENGE_CATALOG[challenge_type]["title"],
+        "notes": notes,
+        "storage_key": storage_key,
+        "storage_backend": storage.kind,
+        "content_type": ct or "application/octet-stream",
+        "duration_sec": result.get("duration_sec"),
+        "metrics": result.get("metrics"),
+        "task_metrics": result.get("task_metrics"),
+        "evaluation": result.get("evaluation"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.voice_challenges.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/voice/challenges/attempts")
+async def list_challenge_attempts(patient_id: Optional[str] = None, user: User = Depends(get_current_user)):
+    q = {}
+    if user.role == "doctor":
+        q["owner_user_id"] = user.user_id
+    elif user.role == "patient":
+        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
+        q["patient_id"] = {"$in": [p["patient_id"] for p in pats]}
+    else:
+        return []
+    if patient_id:
+        q["patient_id"] = patient_id
+    docs = await db.voice_challenges.find(q, {"_id": 0}).sort("created_at", -1).to_list(300)
+    return docs
+
+
+@api_router.delete("/voice/challenges/attempts/{attempt_id}")
+async def delete_challenge_attempt(attempt_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404)
+    if doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=403)
+    try:
+        get_storage().delete(doc["storage_key"])
+    except Exception:
+        pass
+    await db.voice_challenges.delete_one({"attempt_id": attempt_id})
+    return {"ok": True}
+
+
+@api_router.get("/voice/challenges/audio/{attempt_id}")
+async def challenge_audio(attempt_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404)
+    if user.role == "doctor" and doc["owner_user_id"] != user.user_id:
+        raise HTTPException(status_code=403)
+    try:
+        data = get_storage().read_bytes(doc["storage_key"])
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return Response(
+        content=data,
+        media_type=doc.get("content_type", "application/octet-stream"),
+        headers={"Content-Disposition": f'inline; filename="{attempt_id}"'},
     )
 
 

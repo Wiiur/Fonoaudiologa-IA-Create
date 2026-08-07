@@ -169,6 +169,313 @@ def analyze_audio(source_path: str, f0_min: float = 75.0, f0_max: float = 500.0)
             pass
 
 
+# ==================== VOCAL CHALLENGES ====================
+# Interactive challenges the patient performs live with the therapist.
+
+CHALLENGE_CATALOG = {
+    "sustained_vowel": {
+        "id": "sustained_vowel",
+        "title": "Vogal sustentada /a/",
+        "instruction": "Emita a vogal /a/ de forma constante e confortável por 4–5 segundos.",
+        "target": "F0 estável, jitter e shimmer baixos, HNR elevado.",
+        "target_duration_sec": 5,
+    },
+    "mpt": {
+        "id": "mpt",
+        "title": "Tempo Máximo de Fonação (TMF)",
+        "instruction": "Inspire profundamente e sustente a vogal /a/ pelo maior tempo possível, em intensidade e altura confortáveis.",
+        "target": "Adulto masculino > 20s · feminino > 15s.",
+        "target_duration_sec": 25,
+    },
+    "ddk_pataka": {
+        "id": "ddk_pataka",
+        "title": "DDK — /pa-ta-ka/ rápido",
+        "instruction": "Repita rapidamente e de forma clara: pa-ta-ka pa-ta-ka pa-ta-ka… por 5 segundos.",
+        "target": "≥ 6,0 sílabas/segundo em adulto saudável.",
+        "target_duration_sec": 6,
+    },
+    "glissando": {
+        "id": "glissando",
+        "title": "Glissando (extensão vocal)",
+        "instruction": "Vá do som mais grave que consegue até o mais agudo, sustentando a vogal /a/ como uma sirene subindo. Depois refaça descendo.",
+        "target": "Extensão de F0 (semitons) revela alcance vocal.",
+        "target_duration_sec": 8,
+    },
+    "loudness_range": {
+        "id": "loudness_range",
+        "title": "Extensão de loudness",
+        "instruction": "Emita /a/ do mais suave possível ao mais forte, gradualmente. Cerca de 5 segundos.",
+        "target": "Amplitude dinâmica ≥ 30 dB em adulto saudável.",
+        "target_duration_sec": 6,
+    },
+    "sz_ratio": {
+        "id": "sz_ratio",
+        "title": "Relação s/z",
+        "instruction": "Sustente o som /s/ pelo maior tempo que conseguir, respire e depois sustente /z/ da mesma forma. Envie os dois áudios (ou um após o outro).",
+        "target": "s/z ≈ 1,0 · > 1,4 sugere insuficiência glótica.",
+        "target_duration_sec": 20,
+    },
+    "reading": {
+        "id": "reading",
+        "title": "Leitura de texto padrão",
+        "instruction": "Leia em voz habitual: 'O Vento Norte e o Sol discutiam quem era o mais forte quando um viajante apareceu embrulhado em uma capa quente.'",
+        "target": "Avaliação prosódica e articulatória em fala conectada.",
+        "target_duration_sec": 15,
+    },
+}
+
+
+def _syllable_count(sound, threshold_db: float = -25.0, min_dip_db: float = 2.0, min_pause_sec: float = 0.05):
+    """Approximate syllable count via intensity peak detection (de Jong & Wempe 2009 simplified)."""
+    import parselmouth
+    from parselmouth.praat import call
+    try:
+        intensity = sound.to_intensity(minimum_pitch=50.0)
+        vals = intensity.values.flatten()
+        times = intensity.xs()
+        if vals.size < 5:
+            return None, None
+        # Convert to dB relative
+        max_int = float(np.max(vals[np.isfinite(vals)]))
+        rel = vals - max_int  # 0 = peak
+        # Find peaks above threshold with dip criterion
+        peaks = []
+        i = 1
+        while i < len(rel) - 1:
+            if rel[i] > threshold_db and rel[i] >= rel[i - 1] and rel[i] >= rel[i + 1]:
+                # Look for dip before this peak
+                if not peaks or (rel[i] - min(rel[peaks[-1]:i]) >= min_dip_db):
+                    peaks.append(i)
+            i += 1
+        n = len(peaks)
+        duration = float(sound.duration)
+        rate = n / duration if duration > 0 else 0
+        return n, round(rate, 2)
+    except Exception:
+        return None, None
+
+
+def _voiced_duration(sound, f0_min=50.0, f0_max=500.0) -> float:
+    """Total voiced time (seconds)."""
+    try:
+        pitch = sound.to_pitch(time_step=0.01, pitch_floor=f0_min, pitch_ceiling=f0_max)
+        pv = pitch.selected_array["frequency"]
+        return float((pv > 0).sum() * 0.01)
+    except Exception:
+        return 0.0
+
+
+def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
+    """Run analysis tailored to a specific vocal challenge.
+    Returns dict with 'metrics', 'evaluation' (dict with grade/message), and 'task_metrics'.
+    """
+    import parselmouth
+
+    wav_path = _to_wav(source_path)
+    try:
+        sound = parselmouth.Sound(wav_path)
+        duration = float(sound.duration)
+        base = {}
+        task_metrics = {}
+        evaluation = {"grade": "info", "score": None, "message": "", "target_met": None}
+
+        if challenge_type in ("sustained_vowel", "mpt"):
+            # Run acoustic pack
+            metrics_dict = _full_acoustic(sound)
+            base.update(metrics_dict)
+            if challenge_type == "mpt":
+                # Focus on maximum voiced duration
+                voiced = _voiced_duration(sound)
+                task_metrics["mpt_seconds"] = round(voiced, 2)
+                if voiced >= 20:
+                    evaluation = {"grade": "ok", "score": voiced, "target_met": True,
+                                  "message": f"TMF de {voiced:.1f}s — dentro do esperado para adulto saudável."}
+                elif voiced >= 12:
+                    evaluation = {"grade": "warn", "score": voiced, "target_met": False,
+                                  "message": f"TMF de {voiced:.1f}s — reduzido; sugere fadiga vocal ou capacidade respiratória diminuída."}
+                else:
+                    evaluation = {"grade": "alert", "score": voiced, "target_met": False,
+                                  "message": f"TMF de {voiced:.1f}s — significativamente reduzido; investigar suporte respiratório e fechamento glótico."}
+            else:
+                target_met = (
+                    (metrics_dict.get("jitter_local_pct") or 99) < 1.04
+                    and (metrics_dict.get("shimmer_local_pct") or 99) < 3.81
+                    and (metrics_dict.get("hnr_db") or 0) > 20
+                )
+                evaluation = {
+                    "grade": "ok" if target_met else "warn",
+                    "target_met": target_met,
+                    "message": "Padrão estável e periódico." if target_met else "Sinais de instabilidade — revisar apoio respiratório e ataque vocal.",
+                }
+
+        elif challenge_type == "ddk_pataka":
+            n_syl, rate = _syllable_count(sound)
+            base = _full_acoustic(sound, quick=True)
+            task_metrics["syllable_count"] = n_syl
+            task_metrics["ddk_rate_syll_per_sec"] = rate
+            if rate is None:
+                evaluation = {"grade": "info", "message": "Não foi possível estimar taxa DDK — reenvie com áudio mais limpo."}
+            elif rate >= 6.0:
+                evaluation = {"grade": "ok", "score": rate, "target_met": True,
+                              "message": f"Taxa DDK de {rate}/s — adequada para adulto saudável."}
+            elif rate >= 4.5:
+                evaluation = {"grade": "warn", "score": rate, "target_met": False,
+                              "message": f"Taxa DDK de {rate}/s — levemente reduzida; monitorar coordenação motora fina."}
+            else:
+                evaluation = {"grade": "alert", "score": rate, "target_met": False,
+                              "message": f"Taxa DDK de {rate}/s — reduzida; investigar componente motor da fala (disartria?)."}
+
+        elif challenge_type == "glissando":
+            base = _full_acoustic(sound, quick=True)
+            try:
+                pitch = sound.to_pitch(time_step=0.01, pitch_floor=50, pitch_ceiling=800)
+                pv = pitch.selected_array["frequency"]
+                voiced = pv[pv > 0]
+                if voiced.size > 5:
+                    f0_min = float(np.min(voiced))
+                    f0_max_v = float(np.max(voiced))
+                    semitones = 12 * np.log2(f0_max_v / f0_min) if f0_min > 0 else None
+                    task_metrics["f0_min_hz"] = round(f0_min, 1)
+                    task_metrics["f0_max_hz"] = round(f0_max_v, 1)
+                    task_metrics["range_semitones"] = round(float(semitones), 1) if semitones else None
+                    if semitones and semitones >= 24:
+                        evaluation = {"grade": "ok", "score": semitones, "target_met": True,
+                                      "message": f"Extensão de {semitones:.1f} semitons — dentro do esperado para adulto saudável."}
+                    elif semitones and semitones >= 15:
+                        evaluation = {"grade": "warn", "score": semitones, "target_met": False,
+                                      "message": f"Extensão de {semitones:.1f} semitons — reduzida; possível restrição funcional."}
+                    else:
+                        evaluation = {"grade": "alert", "score": semitones, "target_met": False,
+                                      "message": "Extensão vocal reduzida — investigar rigidez das pregas ou restrição de mobilidade laríngea."}
+            except Exception:
+                evaluation = {"grade": "info", "message": "Não foi possível estimar extensão — sinal muito curto ou instável."}
+
+        elif challenge_type == "loudness_range":
+            base = _full_acoustic(sound, quick=True)
+            try:
+                intensity = sound.to_intensity(minimum_pitch=50)
+                vals = intensity.values.flatten()
+                vals = vals[np.isfinite(vals)]
+                if vals.size:
+                    i_min = float(np.percentile(vals, 5))
+                    i_max = float(np.percentile(vals, 95))
+                    task_metrics["intensity_min_db"] = round(i_min, 1)
+                    task_metrics["intensity_max_db"] = round(i_max, 1)
+                    task_metrics["intensity_range_db"] = round(i_max - i_min, 1)
+                    rng = i_max - i_min
+                    if rng >= 30:
+                        evaluation = {"grade": "ok", "score": rng, "target_met": True,
+                                      "message": f"Amplitude dinâmica de {rng:.1f} dB — dentro do esperado."}
+                    elif rng >= 20:
+                        evaluation = {"grade": "warn", "score": rng, "target_met": False,
+                                      "message": f"Amplitude dinâmica de {rng:.1f} dB — reduzida; investigar controle de esforço vocal."}
+                    else:
+                        evaluation = {"grade": "alert", "score": rng, "target_met": False,
+                                      "message": "Amplitude dinâmica muito estreita — possível monotonia ou dificuldade de projeção."}
+            except Exception:
+                evaluation = {"grade": "info", "message": "Falha ao estimar amplitude dinâmica."}
+
+        elif challenge_type == "sz_ratio":
+            # Split into halves: first half assumed /s/, second half /z/
+            n = len(sound.values[0])
+            sr = sound.sampling_frequency
+            half = n // 2
+            samples = sound.values[0]
+            try:
+                s_frame = samples[:half]
+                z_frame = samples[half:]
+                rms_s = float(np.sqrt(np.mean(s_frame ** 2)))
+                rms_z = float(np.sqrt(np.mean(z_frame ** 2)))
+                # Simple duration proxy: how much of each half exceeds threshold
+                thr = np.max(np.abs(samples)) * 0.05
+                s_dur = float(np.sum(np.abs(s_frame) > thr) / sr)
+                z_dur = float(np.sum(np.abs(z_frame) > thr) / sr)
+                ratio = round(s_dur / z_dur, 2) if z_dur > 0 else None
+                task_metrics["s_duration_sec"] = round(s_dur, 2)
+                task_metrics["z_duration_sec"] = round(z_dur, 2)
+                task_metrics["sz_ratio"] = ratio
+                if ratio is not None:
+                    if 0.8 <= ratio <= 1.2:
+                        evaluation = {"grade": "ok", "score": ratio, "target_met": True,
+                                      "message": f"Relação s/z de {ratio} — eficiência glótica adequada."}
+                    elif ratio <= 1.4:
+                        evaluation = {"grade": "warn", "score": ratio, "target_met": False,
+                                      "message": f"Relação s/z de {ratio} — no limite; monitorar coaptação glótica."}
+                    else:
+                        evaluation = {"grade": "alert", "score": ratio, "target_met": False,
+                                      "message": f"Relação s/z de {ratio} — sugere insuficiência glótica (fenda? nódulos?)."}
+            except Exception:
+                evaluation = {"grade": "info", "message": "Falha no cálculo s/z — envie /s/ e /z/ um após o outro num único áudio."}
+
+        elif challenge_type == "reading":
+            base = _full_acoustic(sound, quick=True)
+            n_syl, rate = _syllable_count(sound)
+            task_metrics["syllable_count"] = n_syl
+            task_metrics["speech_rate_syll_per_sec"] = rate
+            evaluation = {"grade": "info", "message": "Análise prosódica de leitura conectada — ver métricas."}
+
+        else:
+            base = _full_acoustic(sound)
+
+        return {
+            "challenge_type": challenge_type,
+            "duration_sec": _safe_float(duration),
+            "metrics": base,
+            "task_metrics": task_metrics,
+            "evaluation": evaluation,
+        }
+    finally:
+        try:
+            Path(wav_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _full_acoustic(sound, quick: bool = False) -> Dict:
+    """Extract acoustic metrics from an already-loaded Sound object (avoid re-reading)."""
+    from parselmouth.praat import call
+    out = {}
+    f0_min, f0_max = 75.0, 500.0
+    try:
+        pitch = sound.to_pitch(time_step=0.01, pitch_floor=f0_min, pitch_ceiling=f0_max)
+        pv = pitch.selected_array["frequency"].astype(float)
+        voiced = pv[pv > 0]
+        out["f0_mean_hz"] = _safe_float(float(np.mean(voiced))) if voiced.size else None
+        out["f0_std_hz"] = _safe_float(float(np.std(voiced))) if voiced.size else None
+        out["phonation_time_sec"] = _safe_float(float((pv > 0).sum() * 0.01))
+    except Exception:
+        pass
+    if quick:
+        try:
+            intensity = sound.to_intensity(minimum_pitch=f0_min)
+            vals = intensity.values.flatten()
+            vals = vals[np.isfinite(vals)]
+            out["intensity_db"] = _safe_float(float(np.mean(vals))) if vals.size else None
+        except Exception:
+            pass
+        return out
+    try:
+        pp = call(sound, "To PointProcess (periodic, cc)", f0_min, f0_max)
+        out["jitter_local_pct"] = _safe_float(call(pp, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3) * 100)
+        out["shimmer_local_pct"] = _safe_float(call([sound, pp], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6) * 100)
+    except Exception:
+        pass
+    try:
+        harm = sound.to_harmonicity(time_step=0.01, minimum_pitch=f0_min)
+        hnr_vals = harm.values[harm.values != -200]
+        out["hnr_db"] = _safe_float(float(np.mean(hnr_vals))) if hnr_vals.size else None
+    except Exception:
+        pass
+    try:
+        intensity = sound.to_intensity(minimum_pitch=f0_min)
+        vals = intensity.values.flatten()
+        vals = vals[np.isfinite(vals)]
+        out["intensity_db"] = _safe_float(float(np.mean(vals))) if vals.size else None
+    except Exception:
+        pass
+    return out
+
+
 def build_clinical_prompt(patient: Dict, metrics: Dict, notes: str = "") -> str:
     """Build a rich Portuguese clinical prompt from metrics."""
     def fmt(v, unit=""):

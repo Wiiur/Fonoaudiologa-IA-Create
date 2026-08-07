@@ -9,6 +9,7 @@ const NAV_DOCTOR = [
   { to: "/activities", icon: "fa-brain", label: "Atividades IA" },
   { to: "/prontuario", icon: "fa-notes-medical", label: "Prontuário" },
   { to: "/voice-lab", icon: "fa-wave-square", label: "Análise Vocal" },
+  { to: "/voice-challenges", icon: "fa-medal", label: "Desafios Vocais" },
   { to: "/reports", icon: "fa-file-signature", label: "Relatórios" },
   { to: "/copilot", icon: "fa-microscope", label: "Copiloto" },
   { to: "/packages", icon: "fa-box-open", label: "Pacotes" },
