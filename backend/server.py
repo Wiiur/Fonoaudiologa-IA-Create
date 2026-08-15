@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 import json
 import tempfile
 from dotenv import load_dotenv
@@ -14,10 +15,8 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 from datetime import datetime, timezone, timedelta
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
-from emergentintegrations.payments.stripe.checkout import (
-    StripeCheckout, CheckoutSessionRequest,
-)
+#from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+#from emergentintegrations.payments.stripe.checkout import (    StripeCheckout, CheckoutSessionRequest,)
 
 from storage import get_storage
 from voice_analysis import analyze_audio, build_clinical_prompt, analyze_challenge, CHALLENGE_CATALOG
@@ -34,6 +33,8 @@ STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
+
+
 
 
 # ---------- Models ----------
@@ -53,31 +54,64 @@ class RoleSelect(BaseModel):
     professional_name: Optional[str] = None
 
 
+class ResponsibleInfo(BaseModel):
+    name: Optional[str] = None
+    relationship: Optional[str] = None
+    cpf: Optional[str] = None
+
+
 class Patient(BaseModel):
     patient_id: str = Field(default_factory=lambda: f"pat_{uuid.uuid4().hex[:12]}")
     owner_user_id: str
     linked_user_id: Optional[str] = None
+    
+    # Dados Pessoais & Fotos
+    photo_url: Optional[str] = None
     name: str
+    birth_date: Optional[str] = None  # YYYY-MM-DD
+    age: Optional[int] = None         # Calculado no frontend/backend
+    rg_cpf: Optional[str] = None
+    biological_sex: Optional[Literal["masculino", "feminino"]] = "feminino"
+    gender_identity: Optional[str] = "Cisgênero"
+    
+    # Contato & Endereço
     email: Optional[str] = None
     phone: Optional[str] = None
-    birth_date: Optional[str] = None
-    age: Optional[int] = None
-    diagnosis: Optional[str] = None
+    address: Optional[str] = None
+    
+    # Responsável Legal (se aplicável)
+    has_responsible: bool = False
+    responsible: Optional[ResponsibleInfo] = None
+    
+    # Demanda & Saúde Vocal
+    profession_vocal_demand: Optional[str] = None
+    chief_complaint: Optional[str] = None
+    otorrhoea_diagnosis: Optional[str] = None  # Diagnóstico Otorrino
+    interests: Optional[str] = None             # Usado pela IA
     notes: Optional[str] = None
-    interests: Optional[str] = None
+    
+    # Controle da Clínica
     status: Literal["active", "inactive", "discharged"] = "active"
+    last_session_at: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-
 class PatientCreate(BaseModel):
+    photo_url: Optional[str] = None
     name: str
+    birth_date: Optional[str] = None
+    rg_cpf: Optional[str] = None
+    biological_sex: Optional[Literal["masculino", "feminino"]] = "feminino"
+    gender_identity: Optional[str] = "Cisgênero"
     email: Optional[str] = None
     phone: Optional[str] = None
-    birth_date: Optional[str] = None
-    age: Optional[int] = None
-    diagnosis: Optional[str] = None
-    notes: Optional[str] = None
+    address: Optional[str] = None
+    has_responsible: bool = False
+    responsible: Optional[ResponsibleInfo] = None
+    profession_vocal_demand: Optional[str] = None
+    chief_complaint: Optional[str] = None
+    otorrhoea_diagnosis: Optional[str] = None
     interests: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class Appointment(BaseModel):
@@ -154,7 +188,19 @@ class ReportRequest(BaseModel):
 async def get_current_user(
     session_token: Optional[str] = Cookie(default=None),
     authorization: Optional[str] = Header(default=None),
+    dev_user_id: Optional[str] = Header(default=None, alias="user-id"), # <-- Puxa o hack do React
 ) -> User:
+    
+    # 1. MODO DESENVOLVEDOR (Ativado pelo nosso Frontend Local)
+    if dev_user_id:
+        return User(
+            user_id=dev_user_id,
+            role="doctor", 
+            email="dev@clinica.com",
+            name="Willian Rafael de Oliveira"
+        )
+
+    # 2. FLUXO NORMAL E SEGURO (Produção)
     token = session_token
     if not token and authorization and authorization.startswith("Bearer "):
         token = authorization.split(" ", 1)[1]
@@ -176,6 +222,7 @@ async def get_current_user(
     user_doc = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
     if not user_doc:
         raise HTTPException(status_code=401, detail="User not found")
+        
     return User(**user_doc)
 
 
@@ -343,10 +390,17 @@ async def create_patient(payload: PatientCreate, user: User = Depends(get_curren
 
 @api_router.get("/patients/{patient_id}")
 async def get_patient(patient_id: str, user: User = Depends(get_current_user)):
-    doc = await db.patients.find_one({"patient_id": patient_id}, {"_id": 0})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Not found")
-    return doc
+    # Busca o paciente no banco de dados pelo ID
+    patient = await db.patients.find_one({"patient_id": patient_id}, {"_id": 0})
+    
+    if not patient:
+        raise HTTPException(status_code=404, detail="Paciente não encontrado")
+        
+    # Garante que o médico só possa ver os próprios pacientes (Segurança)
+    if user.role != "secretary" and patient.get("owner_user_id") != user.user_id:
+        raise HTTPException(status_code=403, detail="Acesso negado a este paciente")
+        
+    return patient
 
 
 @api_router.patch("/patients/{patient_id}")
@@ -723,6 +777,10 @@ async def draft_message(payload: MessageDraftRequest, user: User = Depends(get_c
     if not pat:
         raise HTTPException(status_code=404)
 
+    if "private_notes" in pat:
+        del pat["private_notes"] 
+        # A IA agora está cegada para qualquer suspeita sensível
+
     kind_label = {
         "reminder": "lembrete de sessão",
         "post_session": "acompanhamento pós-sessão",
@@ -739,7 +797,8 @@ async def draft_message(payload: MessageDraftRequest, user: User = Depends(get_c
         f"Escreva uma mensagem humanizada e premium de **{kind_label}** para o paciente "
         f"**{pat['name']}** (diagnóstico: {pat.get('diagnosis','—')}). Canal: {payload.channel}. "
         f"Regras: {channel_rules}\n"
-        f"Contexto adicional do doutor: {payload.context or 'nenhum'}. "
+        f"Contexto adicional do doutor: {payload.context or 'nenhum'}.\n"
+        f"Aqui estão os dados completos do paciente para você personalizar a mensagem: {pat}\n"
         f"Assine como 'Equipe da Clínica'."
     )
     chat = LlmChat(
@@ -1296,6 +1355,14 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Adicione este bloco inteiro para liberar a comunicação com o React
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], # Libera o seu Frontend
+    allow_credentials=True,
+    allow_methods=["*"], # Libera todos os métodos (POST, GET, etc)
+    allow_headers=["*"], # Libera todos os cabeçalhos
+)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

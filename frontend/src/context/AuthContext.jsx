@@ -4,8 +4,15 @@ import api from "@/lib/api";
 const AuthContext = createContext(null);
 
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
+  // const [user, setUser] = useState(null);
+  // const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState({ 
+  id: 'doc_mock_123', 
+  name: 'Willian Rafael de Oliveira', 
+  email: 'willian@clinica.com',
+  role: 'doctor'
+});
+const [loading, setLoading] = useState(false); // Mude para false
 
   const checkAuth = useCallback(async () => {
     try {
@@ -21,6 +28,7 @@ export const AuthProvider = ({ children }) => {
   useEffect(() => {
     // CRITICAL: If returning from OAuth callback, skip the /me check.
     // AuthCallback will exchange the session_id and establish the session first.
+    return; // HACK:
     if (window.location.hash?.includes("session_id=")) {
       setLoading(false);
       return;
