@@ -8,12 +8,19 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+from uuid import uuid4
 import uuid
 import httpx
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
+
+import shutil
+from datetime import date
+
+
+from fastapi.staticfiles import StaticFiles 
 
 #from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
 #from emergentintegrations.payments.stripe.checkout import (    StripeCheckout, CheckoutSessionRequest,)
@@ -34,6 +41,11 @@ STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY")
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
+
+## CORS
+os.makedirs("uploads", exist_ok=True)
+# Diz para o FastAPI: "Tudo que estiver na pasta uploads pode ser acessado pelo navegador"
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
 
@@ -420,6 +432,201 @@ async def delete_patient(patient_id: str, user: User = Depends(get_current_user)
     await db.patients.delete_one({"patient_id": patient_id})
     return {"ok": True}
 
+# ==========================================
+# MODELO DE DADOS PARA ATIVIDADES
+# ==========================================
+class ActivityCreate(BaseModel):
+    patient_id: str
+    title: str
+    type: str # 'casa' ou 'clinica'
+    description: str
+    status: str = "in_progress"
+
+# ==========================================
+# ROTAS PARA ATIVIDADES
+# ==========================================
+@api_router.post("/activities")
+async def create_activity(activity: ActivityCreate):
+    new_activity = activity.model_dump()
+    new_activity["activity_id"] = f"act_{uuid4().hex[:8]}"
+    new_activity["start_date"] = date.today().isoformat()
+    
+    # Se for de clínica, já nasce concluída. Se for para casa, nasce em andamento com 7 dias.
+    if new_activity["type"] == "clinica":
+        new_activity["status"] = "completed"
+    else:
+        new_activity["status"] = "in_progress"
+        
+    new_activity["days_total"] = 7
+    new_activity["days_completed"] = [False, False, False, False, False, False, False]
+    
+    await db.activities.insert_one(new_activity)
+    del new_activity["_id"]
+    return new_activity
+
+@api_router.get("/activities")
+async def get_activities(patient_id: str):
+    activities = await db.activities.find({"patient_id": patient_id}).to_list(100)
+    for a in activities:
+        a["_id"] = str(a["_id"])
+    return activities
+
+# --------- MODELO DE DADOS PARA PASTAS -------------
+
+class FolderCreate(BaseModel):
+    patient_id: str
+    name: str
+
+# --- ROTAS PARA PASTAS-------------------------
+
+@api_router.post("/folders")
+async def create_folder(folder: FolderCreate):
+    new_folder = {
+        "folder_id": f"fold_{uuid4().hex[:8]}", # Gera um ID único curto
+        "patient_id": folder.patient_id,
+        "name": folder.name,
+        "date": date.today().isoformat()
+    }
+    # Salva no MongoDB
+    await db.folders.insert_one(new_folder) 
+    
+    del new_folder["_id"] # Remove o ID nativo do Mongo para não dar erro no React
+    return new_folder
+
+@api_router.get("/folders")
+async def get_folders(patient_id: str):
+    folders = await db.folders.find({"patient_id": patient_id}).to_list(100)
+    for f in folders:
+        f["_id"] = str(f["_id"])
+    return folders
+
+
+
+# ------- ROTAS PARA ARQUIVOS (ANEXOS) --------
+
+@api_router.post("/attachments")
+async def upload_attachment(
+    patient_id: str = Form(...),
+    folder_id: Optional[str] = Form(None),
+    file: UploadFile = File(...)
+):
+    try:
+        # 1. Cria um nome de arquivo único para não sobrescrever arquivos com o mesmo nome
+        file_ext = file.filename.split(".")[-1]
+        unique_filename = f"{uuid4().hex}.{file_ext}"
+        file_path = f"uploads/{unique_filename}"
+
+        # 2. Salva o arquivo real no disco do seu computador
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 3. Calcula o tamanho em MB
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+        # 4. Cria o documento para o MongoDB
+        new_attachment = {
+            "attachment_id": f"att_{uuid4().hex[:8]}",
+            "patient_id": patient_id,
+            "folder_id": folder_id,
+            "name": file.filename,
+            "type": file.content_type,
+            "size": f"{file_size_mb:.2f} MB",
+            "date": date.today().isoformat(),
+            # O React vai ler esse file_url (ex: /uploads/abc1234.pdf)
+            "file_url": f"/uploads/{unique_filename}", 
+            "file_path": file_path # Guardamos o caminho interno para quando formos deletar
+        }
+
+        # 5. Salva a informação no MongoDB
+        await db.attachments.insert_one(new_attachment)
+        del new_attachment["_id"]
+        
+        return new_attachment
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar arquivo: {str(e)}")
+
+
+@api_router.get("/attachments")
+async def get_attachments(patient_id: str):
+    attachments = await db.attachments.find({"patient_id": patient_id}).to_list(100)
+    for a in attachments:
+        a["_id"] = str(a["_id"])
+    return attachments
+
+
+@api_router.delete("/attachments/{attachment_id}")
+async def delete_attachment(attachment_id: str):
+    # 1. Busca o arquivo no MongoDB
+    attachment = await db.attachments.find_one({"attachment_id": attachment_id})
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    
+    # 2. Deleta o arquivo real da pasta 'uploads' no disco
+    if os.path.exists(attachment["file_path"]):
+        os.remove(attachment["file_path"])
+        
+    # 3. Deleta o registro do MongoDB
+    await db.attachments.delete_one({"attachment_id": attachment_id})
+    return {"msg": "Arquivo deletado com sucesso"}
+
+# ==========================================
+# 1. MODELO DE DADOS PARA RELATÓRIOS
+# ==========================================
+class ReportCreate(BaseModel):
+    patient_id: str
+    title: str
+    content: str
+    format: str
+    status: str # 'draft' (rascunho) ou 'final' (finalizado)
+
+# ==========================================
+# 2. ROTAS PARA RELATÓRIOS (MONGODB)
+# ==========================================
+
+# Criar um novo relatório
+@api_router.post("/reports")
+async def create_report(report: ReportCreate):
+    new_report = report.model_dump()
+    new_report["report_id"] = f"rep_{uuid.uuid4().hex[:8]}"
+    new_report["date"] = date.today().isoformat()
+    
+    # Salva no banco de dados
+    await db.reports.insert_one(new_report)
+    
+    del new_report["_id"] # Remove o ID nativo do Mongo para não bugar o React
+    return new_report
+
+# Atualizar um relatório existente (Ex: salvar alterações no rascunho)
+@api_router.put("/reports/{report_id}")
+async def update_report(report_id: str, report: ReportCreate):
+    updated_data = report.model_dump()
+    updated_data["date"] = date.today().isoformat()
+    
+    # Procura pelo report_id e atualiza as informações
+    result = await db.reports.update_one(
+        {"report_id": report_id}, 
+        {"$set": updated_data}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Relatório não encontrado")
+        
+    return {"msg": "Relatório atualizado com sucesso"}
+
+# Buscar todos os relatórios de um paciente para mostrar no histórico
+@api_router.get("/reports")
+async def get_reports(patient_id: str):
+    reports = await db.reports.find({"patient_id": patient_id}).to_list(100)
+    for r in reports:
+        r["_id"] = str(r["_id"])
+    return reports
+
+# Excluir um relatório
+@api_router.delete("/reports/{report_id}")
+async def delete_report(report_id: str):
+    await db.reports.delete_one({"report_id": report_id})
+    return {"msg": "Relatório deletado com sucesso"}
 
 # ---------- Appointments ----------
 @api_router.get("/appointments")
