@@ -1,0 +1,21 @@
+{
+  "short_name": "VoxApp",
+  "name": "VoxIntelligence - Portal do Paciente",
+  "icons": [
+    {
+      "src": "/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "start_url": "/portal",
+  "display": "standalone",
+  "theme_color": "#D46F54",
+  "background_color": "#FAF9F6",
+  "orientation": "portrait"
+}

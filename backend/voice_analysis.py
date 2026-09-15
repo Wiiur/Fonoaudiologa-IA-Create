@@ -270,6 +270,7 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
     Returns dict with 'metrics', 'evaluation' (dict with grade/message), and 'task_metrics'.
     """
     import parselmouth
+    import numpy as np # Importando caso não esteja no escopo da função
 
     wav_path = _to_wav(source_path)
     try:
@@ -279,11 +280,31 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
         task_metrics = {}
         evaluation = {"grade": "info", "score": None, "message": "", "target_met": None}
 
-        if challenge_type in ("sustained_vowel", "mpt"):
+        # --- BLOCO DE SEGURANÇA (110% ERROR-PROOF) ---
+        intensity = sound.to_intensity(minimum_pitch=50.0)
+        vals = intensity.values.flatten()
+        vals = vals[np.isfinite(vals)]
+        
+        if len(vals) == 0 or np.max(vals) < 30.0:
+            # Se o áudio estiver abaixo de 30dB, é apenas silêncio/ruído de cabo.
+            return {
+                "challenge_type": challenge_type,
+                "duration_sec": round(duration, 2),
+                "metrics": {},
+                "task_metrics": {},
+                "evaluation": {
+                    "grade": "alert",
+                    "message": "Nenhum som vocal detectado. O áudio está muito baixo ou em silêncio. Por favor, regrave."
+                }
+            }
+        # -------------------------------------------
+
+        # --- MAPEAMENTO DE IDs (INGLÊS + PORTUGUÊS DO BANCO) ---
+        if challenge_type in ("sustained_vowel", "mpt", "vogal_a_prolongada"):
             # Run acoustic pack
             metrics_dict = _full_acoustic(sound)
             base.update(metrics_dict)
-            if challenge_type == "mpt":
+            if challenge_type in ("mpt", "vogal_a_prolongada"):
                 # Focus on maximum voiced duration
                 voiced = _voiced_duration(sound)
                 task_metrics["mpt_seconds"] = round(voiced, 2)
@@ -308,7 +329,7 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
                     "message": "Padrão estável e periódico." if target_met else "Sinais de instabilidade — revisar apoio respiratório e ataque vocal.",
                 }
 
-        elif challenge_type == "ddk_pataka":
+        elif challenge_type in ("ddk_pataka",):
             n_syl, rate = _syllable_count(sound)
             base = _full_acoustic(sound, quick=True)
             task_metrics["syllable_count"] = n_syl
@@ -325,7 +346,7 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
                 evaluation = {"grade": "alert", "score": rate, "target_met": False,
                               "message": f"Taxa DDK de {rate}/s — reduzida; investigar componente motor da fala (disartria?)."}
 
-        elif challenge_type == "glissando":
+        elif challenge_type in ("glissando", "glissando_sirene", "voo_do_aviao"):
             base = _full_acoustic(sound, quick=True)
             try:
                 pitch = sound.to_pitch(time_step=0.01, pitch_floor=50, pitch_ceiling=800)
@@ -350,7 +371,7 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
             except Exception:
                 evaluation = {"grade": "info", "message": "Não foi possível estimar extensão — sinal muito curto ou instável."}
 
-        elif challenge_type == "loudness_range":
+        elif challenge_type in ("loudness_range", "metodo_lsvt_loud"):
             base = _full_acoustic(sound, quick=True)
             try:
                 intensity = sound.to_intensity(minimum_pitch=50)
@@ -375,7 +396,7 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
             except Exception:
                 evaluation = {"grade": "info", "message": "Falha ao estimar amplitude dinâmica."}
 
-        elif challenge_type == "sz_ratio":
+        elif challenge_type in ("sz_ratio", "relacao_s_z"):
             # Split into halves: first half assumed /s/, second half /z/
             n = len(sound.values[0])
             sr = sound.sampling_frequency
@@ -407,12 +428,12 @@ def analyze_challenge(source_path: str, challenge_type: str) -> Dict:
             except Exception:
                 evaluation = {"grade": "info", "message": "Falha no cálculo s/z — envie /s/ e /z/ um após o outro num único áudio."}
 
-        elif challenge_type == "reading":
+        elif challenge_type in ("reading", "leitura_sobrearticulada", "terapia_lax_vox", "fonacao_reversa", "boca_chiusa", "trinado_labios", "messa_di_voce", "fricativas_marcadas"):
             base = _full_acoustic(sound, quick=True)
             n_syl, rate = _syllable_count(sound)
             task_metrics["syllable_count"] = n_syl
             task_metrics["speech_rate_syll_per_sec"] = rate
-            evaluation = {"grade": "info", "message": "Análise prosódica de leitura conectada — ver métricas."}
+            evaluation = {"grade": "info", "message": "Análise prosódica/articulatória gravada com sucesso — ver métricas."}
 
         else:
             base = _full_acoustic(sound)
@@ -477,43 +498,49 @@ def _full_acoustic(sound, quick: bool = False) -> Dict:
 
 
 def build_clinical_prompt(patient: Dict, metrics: Dict, notes: str = "") -> str:
-    """Build a rich Portuguese clinical prompt from metrics."""
+    """Build a rich Portuguese clinical prompt from metrics, focusing on Evidence-Based Diagnosis."""
     def fmt(v, unit=""):
         return f"{v}{unit}" if v is not None else "—"
 
     m = metrics
     lines = [
-        f"# Contexto clínico",
+        f"# CONTEXTO CLÍNICO DO PACIENTE",
         f"- Paciente: {patient.get('name', '—')} ({patient.get('age', '—')} anos)",
-        f"- Diagnóstico prévio: {patient.get('diagnosis', '—')}",
-        f"- Observações do doutor: {notes or '—'}",
+        f"- Sexo Biológico: {patient.get('gender', '—')}",
+        f"- Diagnóstico Prévio/Queixa: {patient.get('chief_complaint', '—')}",
+        f"- Observações do Clínico: {notes or '—'}",
         "",
-        "# Métricas acústicas extraídas (Praat/Parselmouth)",
+        "# MATEMÁTICA ACÚSTICA EXTRAÍDA (Motor Parselmouth)",
         f"- Duração do sinal: {fmt(m.get('duration_sec'), ' s')}",
         f"- Tempo de fonação vozeada: {fmt(m.get('phonation_time_sec'), ' s')}",
-        f"- F0 médio: {fmt(m.get('f0_mean_hz'), ' Hz')} · Desvio: {fmt(m.get('f0_std_hz'), ' Hz')}",
-        f"- Jitter (local): {fmt(m.get('jitter_local_pct'), ' %')}",
-        f"- Shimmer (local): {fmt(m.get('shimmer_local_pct'), ' %')}",
-        f"- HNR: {fmt(m.get('hnr_db'), ' dB')}",
+        f"- F0 médio: {fmt(m.get('f0_mean_hz'), ' Hz')} · Desvio (Pitch Sigma): {fmt(m.get('f0_std_hz'), ' Hz')}",
+        f"- Jitter (local): {fmt(m.get('jitter_local_pct'), ' %')} (Limiar normativo: < 1.04%)",
+        f"- Shimmer (local): {fmt(m.get('shimmer_local_pct'), ' %')} (Limiar normativo: < 3.81%)",
+        f"- HNR (Proporção Harmônico-Ruído): {fmt(m.get('hnr_db'), ' dB')} (Limiar normativo: > 20 dB)",
         f"- Formantes: F1={fmt(m.get('f1_hz'), ' Hz')} · F2={fmt(m.get('f2_hz'), ' Hz')} · F3={fmt(m.get('f3_hz'), ' Hz')}",
         f"- Intensidade média: {fmt(m.get('intensity_db'), ' dB')}",
-        f"- CPP (aprox.): {fmt(m.get('cpp_db'), ' dB')}",
+        f"- CPP (Cepstral Peak Prominence): {fmt(m.get('cpp_db'), ' dB')}",
         "",
-        "# Faixas de referência (voz adulta saudável, uso indicativo)",
-        "- F0 masculino ~85–180 Hz · feminino ~165–255 Hz",
-        "- Jitter local < 1,04% · Shimmer local < 3,81% · HNR > 20 dB (Teixeira, 2013)",
-        "- CPP > 12 dB associado a menor rugosidade",
+        "# SUA TAREFA: DIAGNÓSTICO FONOAUDIOLÓGICO BASEADO EM EVIDÊNCIAS",
+        "Atue como um Fonoaudiólogo Pesquisador e Clínico especialista em Voz. Você deve analisar as métricas acústicas "
+        "acima, cruzar com a queixa do paciente e gerar um Parecer Diagnóstico Fundamentado. *NÃO GERE UM LAUDO CORRIDO, MAS SIM UMA ANÁLISE.*",
         "",
-        "# Tarefa",
-        "Gere um **Laudo Fonoaudiológico de Análise Acústica** em Português (BR), estruturado em Markdown:",
-        "## 1. Identificação e Tarefa",
-        "## 2. Parâmetros Acústicos (tabela + interpretação clínica de cada métrica)",
-        "## 3. Padrão Vocal Observado (grau geral: normal, disfonia leve/moderada/severa, tipo predominante)",
-        "## 4. Hipóteses Fonoaudiológicas",
-        "## 5. Recomendações (terapia, exames complementares, encaminhamentos)",
-        "## 6. Ressalvas e Limitações da análise instrumental",
+        "ESTRUTURE SUA RESPOSTA EM MARKDOWN EXATAMENTE NESTES TÓPICOS:",
+        "### 1. Parecer Acústico",
+        "(Faça uma leitura analítica sobre como a F0 se relaciona com o sexo/idade do paciente e explique o impacto do Jitter e Shimmer encontrados na qualidade vocal. Diga explicitamente se o padrão é de normalidade ou qual o nível do desvio.)",
         "",
-        "Regras: linguagem técnica, cite referências normativas quando pertinente, evite diagnóstico médico definitivo, "
-        "explicite qualquer métrica ausente ('—') como limitação. Ao final, deixe campo para assinatura profissional.",
+        "### 2. Hipótese Diagnóstica Fonoaudiológica",
+        "(Baseado nos dados, qual a provável condição clínica biomecânica ocorrendo nas pregas vocais? Ex: Tensão glótica, fenda, nódulo...)",
+        "",
+        "### 3. Evidências e Base Bibliográfica",
+        "(Crie este tópico listando referências científicas da fonoaudiologia que fundamentem por que você chegou à conclusão acima. Exemplo obrigatório de referência cruzada: 'Segundo Behlau (2001) em *Voz: O Livro do Especialista*, o aumento conjugado de Shimmer e a redução do HNR para [Valor] indicam presença de ruído glótico...' ou cite Teixeira (2013) sobre os limiares MDVP.)",
+        "",
+        "### 4. Direcionamento Terapêutico",
+        "(Recomende técnicas vocais específicas e cientificamente validadas para este quadro, como ETVSO, sobrearticulação, etc.)",
+        "",
+        "REGRAS ESTRITAS DE CONDUTA:",
+        "- Mantenha a formalidade científica em 100% do texto.",
+        "- Se algum valor estiver faltando ('—'), justifique que a extração foi limitada pela qualidade do sinal.",
+        "- NUNCA feche diagnóstico médico definitivo (deixe claro que imagens laríngeas são necessárias)."
     ]
     return "\n".join(lines)
