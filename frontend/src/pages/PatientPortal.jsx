@@ -230,8 +230,42 @@ export default function PatientPortal() {
         </DialogContent>
       </Dialog>
 
+      {/* ========================================== */}
+      {/* MODAL DE TREINO VOCAL (ATIVIDADE REAL)       */}
+      {/* ========================================== */}
       <Dialog open={!!selectedActivity} onOpenChange={() => setSelectedActivity(null)}>
-        <DialogContent className="max-w-md w-[90vw] bg-stone-900 border-stone-800 text-white rounded-[2rem] p-6 pt-10 text-center hide-default-close"><button onClick={() => setSelectedActivity(null)} className="absolute top-4 right-4 text-stone-400"><X size={20}/></button><div className="w-16 h-16 bg-indigo-500/20 text-indigo-400 rounded-full flex items-center justify-center mx-auto mb-4"><AudioLines size={32} /></div><DialogTitle className="font-heading text-2xl mb-2">{selectedActivity?.title}</DialogTitle><p className="text-xs text-stone-400 mb-8">{selectedActivity?.desc}</p><div className="bg-stone-800 rounded-2xl p-6 mb-8 shadow-inner"><div className="flex items-center justify-center gap-1 h-12 mb-6">{[40, 70, 40, 90, 60, 30, 80, 50, 20].map((h, i) => (<div key={i} className="w-2 bg-indigo-500 rounded-full animate-pulse" style={{ height: `${h}%`, animationDelay: `${i * 0.1}s` }}></div>))}</div><Button className="w-16 h-16 rounded-full bg-indigo-500 hover:bg-indigo-600 text-white shadow-lg shadow-indigo-500/30"><Play size={24} className="ml-1" /></Button></div><Button onClick={() => completeActivity.mutate(selectedActivity)} disabled={completeActivity.isPending} className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-bold h-14 rounded-xl text-base">{completeActivity.isPending ? "Processando..." : "Marcar como Concluído"}</Button></DialogContent>
+        <DialogContent className="max-w-md w-[90vw] bg-white border-stone-200 rounded-[2rem] p-0 overflow-hidden flex flex-col max-h-[85vh] hide-default-close">
+          
+          <div className="bg-indigo-600 p-6 text-white shrink-0 relative flex flex-col items-center text-center">
+            <button onClick={() => setSelectedActivity(null)} className="absolute top-4 right-4 p-2 bg-black/10 hover:bg-black/20 rounded-full transition-colors backdrop-blur-sm">
+              <X size={16}/>
+            </button>
+            <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mb-3 border border-white/20">
+              <AudioLines size={32} className="text-white" />
+            </div>
+            <DialogTitle className="font-heading text-xl leading-tight">{selectedActivity?.title}</DialogTitle>
+            <p className="text-[10px] uppercase tracking-widest text-indigo-200 font-bold mt-2">
+              Prescrito pela Clínica
+            </p>
+          </div>
+          
+          <div className="p-6 overflow-y-auto custom-scrollbar flex-1 bg-stone-50">
+            {/* Texto detalhado com quebra de linhas reais geradas pela IA */}
+            <div className="text-sm text-stone-700 leading-relaxed whitespace-pre-wrap font-medium bg-white p-5 rounded-2xl border border-stone-100 shadow-sm">
+              {selectedActivity?.description || selectedActivity?.desc || "Nenhuma instrução detalhada fornecida para este exercício."}
+            </div>
+          </div>
+
+          <div className="p-5 border-t border-stone-100 shrink-0 bg-white shadow-[0_-10px_30px_rgba(0,0,0,0.03)] z-10">
+            <Button 
+              onClick={() => completeActivity.mutate(selectedActivity)} 
+              disabled={completeActivity.isPending} 
+              className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-bold h-14 rounded-xl text-base shadow-md transition-transform active:scale-[0.98]"
+            >
+              {completeActivity.isPending ? "Registrando progresso..." : "Finalizei o Treino de Hoje!"}
+            </Button>
+          </div>
+        </DialogContent>
       </Dialog>
 
       <Dialog open={!!selectedDiary} onOpenChange={() => setSelectedDiary(null)}>

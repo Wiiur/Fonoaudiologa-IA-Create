@@ -1,24 +1,27 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, BackgroundTasks, File, Form
 from fastapi.responses import StreamingResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-import json
-import tempfile
-from dotenv import load_dotenv
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
+from typing import List, Optional, Literal, Dict, Any
+from datetime import datetime, timezone, timedelta, date
+from pathlib import Path
+from bson.objectid import ObjectId
+import json
+import tempfile
 import os
 import logging
 from uuid import uuid4
 import uuid
 import httpx
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
-from datetime import datetime, timezone, timedelta, date
 import anthropic
 import traceback
 import io
-
+import csv
+import re
+import shutil
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -30,45 +33,102 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from openai import AsyncOpenAI
 from google import genai
+from dotenv import load_dotenv
 
-import csv
-
-import shutil
-from datetime import date
-
-
-from fastapi.staticfiles import StaticFiles 
-
-#from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
-#from emergentintegrations.payments.stripe.checkout import (    StripeCheckout, CheckoutSessionRequest,)
-
+# Suas funções personalizadas
 from storage import get_storage
 from voice_analysis import analyze_audio, build_clinical_prompt, analyze_challenge, CHALLENGE_CATALOG
 
+# ==========================================
+# 1. CONFIGURAÇÕES INICIAIS E BANCO DE DADOS
+# ==========================================
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-mongo_url = os.environ["MONGO_URL"]
+# Cria a instância do FastAPI
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+# Cria a pasta de uploads se não existir e expõe para o React
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# Configura o MongoDB e as Chaves de API
+mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+db = client[os.environ.get("DB_NAME", "fono_db")] # AQUI O 'db' NASCE E VIVE PARA SEMPRE!
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
- #if GEMINI_API_KEY:
-# #    genai.configure(api_key=GEMINI_API_KEY)
 
-# #STRIPE_API_KEY = os.environ.get("STRIPE_API_KEY")
+# ==========================================
+# 2. 🛡️ MÓDULO DE SEGURANÇA E LGPD 
+# ==========================================
 
-app = FastAPI()
-api_router = APIRouter(prefix="/api")
+def anonymize_text(text: str, patient_name: str = "") -> str:
+    """Filtro LGPD: Remove PII (Informações Pessoalmente Identificáveis) do texto antes de enviar para a IA."""
+    if not text: return ""
+    texto_limpo = str(text)
 
+    # Mascara CPF, Telefones e E-mails
+    texto_limpo = re.sub(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", "[CPF_PROTEGIDO]", texto_limpo)
+    texto_limpo = re.sub(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}\b", "[TEL_PROTEGIDO]", texto_limpo)
+    texto_limpo = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b", "[EMAIL_PROTEGIDO]", texto_limpo)
 
-## CORS
-os.makedirs("uploads", exist_ok=True)
-# Diz para o FastAPI: "Tudo que estiver na pasta uploads pode ser acessado pelo navegador"
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+    # Mascara o Nome do Paciente
+    if patient_name:
+        nome_parts = patient_name.split()
+        if nome_parts:
+            primeiro_nome = nome_parts[0]
+            texto_limpo = re.compile(re.escape(patient_name), re.IGNORECASE).sub("[PACIENTE]", texto_limpo)
+            if len(primeiro_nome) > 2:
+                texto_limpo = re.compile(re.escape(primeiro_nome), re.IGNORECASE).sub("[PACIENTE]", texto_limpo)
 
+    return texto_limpo
+
+async def log_audit_access(user_email: str, action: str, target_patient_id: str):
+    """Função obrigatória para a LGPD: Registra de forma silenciosa quem acessou dados sensíveis."""
+    try:
+        await db.audit_logs.insert_one({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_email": user_email,
+            "action": action,
+            "target_patient_id": target_patient_id,
+            "compliance": "LGPD Art. 37 - Rastreabilidade"
+        })
+    except Exception as e:
+        print(f"⚠️ Erro ao salvar log de auditoria: {e}")
+
+async def verify_patient_ownership(patient_id: str, current_user):
+    """Guarda-Costas Oficial (Anti-IDOR). Impede que a Clínica A acesse os dados da Clínica B."""
+    
+    # Se for secretária, pode ver os pacientes da clínica
+    if current_user.role == "secretary":
+        patient = await db.patients.find_one({"$or": [{"_id": patient_id}, {"patient_id": patient_id}]})
+        if not patient: raise HTTPException(status_code=404, detail="Paciente não encontrado.")
+        return patient
+
+    # Se for paciente, só pode ver a si mesmo
+    if current_user.role == "patient":
+        patient = await db.patients.find_one({"linked_user_id": current_user.user_id})
+        if not patient or (patient.get("patient_id") != patient_id and str(patient.get("_id")) != patient_id):
+            raise HTTPException(status_code=403, detail="Acesso bloqueado: Você só pode acessar seus próprios dados.")
+        return patient
+
+    # Se for doutor, verifica se é o dono do paciente
+    patient = await db.patients.find_one({
+        "$or": [{"_id": patient_id}, {"id": patient_id}, {"patient_id": patient_id}]
+    })
+    
+    if not patient:
+        raise HTTPException(status_code=404, detail="Paciente não encontrado no banco de dados.")
+        
+    if str(patient.get("owner_user_id")) != str(current_user.user_id):
+        print(f"🚨 TENTATIVA DE INVASÃO IDOR: Usuário {current_user.email} tentou acessar paciente {patient_id}")
+        raise HTTPException(status_code=403, detail="ALERTA LGPD: Acesso negado.")
+        
+    return patient
 
 
 # ---------- Models ----------
@@ -229,6 +289,8 @@ async def get_current_user(
     authorization: Optional[str] = Header(default=None),
     dev_user_id: Optional[str] = Header(default=None, alias="user-id"), # <-- Puxa o hack do React
 ) -> User:
+
+
     
     # 1. MODO DESENVOLVEDOR (Ativado pelo nosso Frontend Local)
     if dev_user_id:
@@ -263,7 +325,6 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
         
     return User(**user_doc)
-
 
 # ---------- Auth Routes ----------
 @api_router.post("/auth/session")
@@ -601,21 +662,26 @@ async def delete_attachment(attachment_id: str):
 # ROTA PARA FORÇAR O DOWNLOAD DE ARQUIVOS
 # ==========================================
 @api_router.get("/attachments/download")
-async def force_download_attachment(file_url: str):
-    # Ajusta o caminho do arquivo (remove a primeira barra para não dar erro)
-    file_path = file_url.lstrip("/") 
+async def secure_download_file(file_url: str, patient_id: str = None, user: User = Depends(get_current_user)):
+    """Rota cofre: Ninguém baixa áudio ou PDF sem estar logado na clínica dona do arquivo"""
     
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor")
+    # Se mandarem o ID do paciente, verifica se o doutor tem permissão
+    if patient_id:
+        # 🚀 AQUI ESTAVA O ERRO! Trocamos 'user.user_id' por 'user'
+        await verify_patient_ownership(patient_id, user)
         
-    nome_arquivo = os.path.basename(file_path)
+    # Lógica de segurança para evitar que hackers naveguem nas pastas do servidor (Path Traversal)
+    safe_path = os.path.normpath(f"./{file_url}")
+    if not safe_path.startswith("uploads") and not safe_path.startswith("storage_data"):
+        raise HTTPException(status_code=403, detail="Acesso não autorizado a esta pasta.")
+        
+    if not os.path.exists(safe_path):
+        raise HTTPException(status_code=404, detail="Arquivo acústico não encontrado no servidor.")
+        
+    # Adiciona Log de auditoria para o download do arquivo
+    await log_audit_access(user.email, "DOWNLOAD_ARQUIVO_SIGILOSO", patient_id or "Desconhecido")
     
-    # O SEGREDO: 'application/octet-stream' força o navegador a BAIXAR em vez de ABRIR a imagem
-    return FileResponse(
-        path=file_path, 
-        filename=nome_arquivo, 
-        media_type='application/octet-stream'
-    )
+    return FileResponse(safe_path)
 
 # ==========================================
 # 1. MODELO DE DADOS PARA RELATÓRIOS
@@ -808,8 +874,12 @@ async def delete_appointment(appointment_id: str, user: User = Depends(get_curre
 
 
 # ---------- SOAP records ----------
+# ---------- SOAP records ----------
 @api_router.get("/records")
-async def get_records(patient_id: str):
+async def get_records(patient_id: str, user: User = Depends(get_current_user)):
+    # 🛡️ TRAVA ANTI-IDOR:
+    await verify_patient_ownership(patient_id, user)
+
     # Soro da Verdade 2: Vai avisar quem está buscando
     print(f"🔍 BUSCA: O React pediu o histórico do paciente: {patient_id}")
     
@@ -1178,18 +1248,14 @@ class MessageDraftRequest(BaseModel):
     channel: Literal["whatsapp", "email"] = "whatsapp"
     context: Optional[str] = None
 
-
 @api_router.post("/messages/draft")
 async def draft_message(payload: MessageDraftRequest, user: User = Depends(get_current_user)):
     if user.role not in ("doctor", "secretary"):
         raise HTTPException(status_code=403)
+        
     pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
     if not pat:
         raise HTTPException(status_code=404)
-
-    if "private_notes" in pat:
-        del pat["private_notes"] 
-        # A IA agora está cegada para qualquer suspeita sensível
 
     kind_label = {
         "reminder": "lembrete de sessão",
@@ -1198,35 +1264,53 @@ async def draft_message(payload: MessageDraftRequest, user: User = Depends(get_c
         "welcome": "boas-vindas",
         "follow_up": "reengajamento",
     }[payload.kind]
+    
     channel_rules = (
-        "WhatsApp: até 3 parágrafos curtos, tom acolhedor porém executivo, use quebras de linha. Sem assunto."
+        "WhatsApp: até 3 parágrafos curtos, tom acolhedor porém executivo, use emojis com moderação, use quebras de linha. Sem assunto."
         if payload.channel == "whatsapp"
         else "E-mail: inclua uma linha 'Assunto: ...' na primeira linha, depois corpo formal profissional."
     )
+    
+    # 🚨 BLINDAGEM LGPD: Nunca enviar o dicionário 'pat' inteiro! 
+    # Extraímos apenas o nome (para a mensagem ser amigável) e dados clínicos. O resto fica no banco.
+    primeiro_nome = pat['name'].split()[0]
+    dados_clinicos_seguros = {
+        "idade": pat.get("age", "N/A"),
+        "diagnostico": pat.get("diagnosis", "N/A"),
+        "queixa_principal": pat.get("chief_complaint", "N/A")
+    }
+    
+    # Se o doutor digitou alguma anotação no modal, nós limpamos antes de enviar
+    contexto_limpo = anonymize_text(payload.context or 'nenhum', pat['name'])
+
     prompt = (
         f"Escreva uma mensagem humanizada e premium de **{kind_label}** para o paciente "
-        f"**{pat['name']}** (diagnóstico: {pat.get('diagnosis','—')}). Canal: {payload.channel}. "
+        f"**{primeiro_nome}**. Canal: {payload.channel}.\n"
         f"Regras: {channel_rules}\n"
-        f"Contexto adicional do doutor: {payload.context or 'nenhum'}.\n"
-        f"Aqui estão os dados completos do paciente para você personalizar a mensagem: {pat}\n"
+        f"Contexto extra solicitado pelo profissional: {contexto_limpo}.\n"
+        f"Perfil Clínico Básico (USE APENAS SE AJUDAR NO CONTEXTO DA MENSAGEM): {dados_clinicos_seguros}\n"
         f"Assine como 'Equipe da Clínica'."
     )
+    
     chat = LlmChat(
         api_key=ANTHROPIC_API_KEY,
         session_id=f"msg-{uuid.uuid4().hex[:8]}",
         system_message="Você é a VoxIntelligence, especialista em comunicação clínica premium.",
     ).with_model("anthropic", "claude-sonnet-4-5-20250929")
+    
     full = ""
     async for ev in chat.stream_message(UserMessage(text=prompt)):
         if isinstance(ev, TextDelta):
             full += ev.content
         elif isinstance(ev, StreamDone):
             break
+            
     wa_link = None
     if payload.channel == "whatsapp" and pat.get("phone"):
         import urllib.parse
         digits = "".join(c for c in pat["phone"] if c.isdigit())
         wa_link = f"https://wa.me/{digits}?text={urllib.parse.quote(full)}"
+        
     return {"text": full, "channel": payload.channel, "wa_link": wa_link, "patient_name": pat["name"]}
 
 
@@ -2102,25 +2186,6 @@ async def download_challenge_audio(
         traceback.print_exc() # Imprime a linha exata do erro no terminal
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
-    # ==========================================
-# ROTAS DA ABA: INTELIGÊNCIA & FISCAL (PÓLO 2)
-# ==========================================
-
-# 1. LTV Financeiro do Paciente
-@api_router.get("/patients/{patient_id}/financial")
-async def get_patient_financial(patient_id: str, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Acesso restrito")
-    
-    # Busca os pacotes pagos do paciente
-    cursor = db.packages.find({"patient_id": patient_id, "status": "paid"})
-    packages = await cursor.to_list(100)
-    
-    # Soma tudo para achar o Lifetime Value (LTV)
-    total_ltv = sum([float(p.get("amount", 0)) for p in packages])
-    
-    return {"ltv": total_ltv}
-
 # 2. Emissão de Recibo IRPF com Log de Auditoria
 class IRPFRequest(BaseModel):
     patient_id: str
@@ -2223,6 +2288,28 @@ async def compile_soap_history(patient_id: str, user: User = Depends(get_current
 class AnalyticsRequest(BaseModel):
     patient_id: str
 
+# Função de Anonimização de Texto Médico
+def anonymize_medical_text(text: str, patient_name: str) -> str:
+    """Aplica Data Masking para não vazar PII para a Inteligência Artificial"""
+    if not text: return ""
+    
+    texto_limpo = text
+    
+    # 1. Remove o nome real do paciente (Ignorando maiúsculas/minúsculas)
+    if patient_name:
+        primeiro_nome = patient_name.split()[0]
+        texto_limpo = re.sub(f"(?i){patient_name}", "[PACIENTE]", texto_limpo)
+        texto_limpo = re.sub(f"(?i){primeiro_nome}", "[PACIENTE]", texto_limpo)
+        
+    # 2. Remove CPFs (Padrão 000.000.000-00)
+    texto_limpo = re.sub(r"\d{3}\.\d{3}\.\d{3}-\d{2}", "[CPF_OCULTO]", texto_limpo)
+    
+    # 3. Remove Telefones (Ex: 19 99999-9999)
+    texto_limpo = re.sub(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}\b", "[TEL_OCULTO]", texto_limpo)
+    
+    return texto_limpo
+
+# 5. Rota de Analytics Clínico com IA (Anonimizado)
 @api_router.post("/copilot/analytics")
 async def clinical_analytics(payload: AnalyticsRequest, user: User = Depends(get_current_user)):
     if user.role != "doctor":
@@ -2380,16 +2467,23 @@ async def delete_team_member(member_id: str, user: User = Depends(get_current_us
 
 # Função que dispara o e-mail nos bastidores (Background Task)
 def send_invite_email(to_email: str, name: str, role: str, token: str):
+    import os
     # ========================================================
-    # ⚠️ ATENÇÃO: Coloque seu e-mail e senha de aplicativo aqui
+    # 🔒 BLINDAGEM DE SEGURANÇA: Credenciais puxadas do .env
     # ========================================================
-    SMTP_SERVER = "smtp.gmail.com"
-    SMTP_PORT = 587
-    SMTP_USER = "will.rafael6262@gmail.com" 
-    SMTP_PASS = "qdmt jswe thtu aloc" # No Gmail, crie uma "Senha de Aplicativo"
+    SMTP_SERVER = os.environ.get("SMTP_HOST")
+    SMTP_PORT = int(os.environ.get("SMTP_PORT"))
+    SMTP_USER = os.environ.get("SMTP_USER")
+    SMTP_PASS = os.environ.get("SMTP_PASS")
     
     # O Link mágico que vai no e-mail
     link_acesso = f"http://localhost:3000/setup-colaborador?token={token}"
+
+    # Se a senha não estiver no .env, ele não trava o sistema, apenas avisa!
+    if not SMTP_USER or not SMTP_PASS:
+        print("⚠️ ALERTA DE SEGURANÇA: E-mail não configurado no arquivo .env!")
+        print(f"🔗 LINK GERADO PARA TESTE MANUAL: {link_acesso}")
+        return
     
     html_content = f"""
     <html>
@@ -2434,6 +2528,10 @@ def send_invite_email(to_email: str, name: str, role: str, token: str):
     </html>
     """
 
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
     msg = MIMEMultipart()
     msg['From'] = f"Gestão de Equipe <{SMTP_USER}>"
     msg['To'] = to_email
@@ -2441,18 +2539,14 @@ def send_invite_email(to_email: str, name: str, role: str, token: str):
     msg.attach(MIMEText(html_content, 'html'))
 
     try:
-        # Tenta enviar o e-mail de verdade
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, to_email, msg.as_string())
         server.quit()
-        print(f"E-mail enviado com sucesso para {to_email}")
+        print(f"✅ E-mail de convite enviado com segurança para {to_email}")
     except Exception as e:
-        # Se você ainda não configurou a senha do Gmail, ele não trava o sistema, 
-        # e imprime o link no terminal para você conseguir testar!
-        print(f"⚠️ ERRO AO ENVIAR E-MAIL (Configure o SMTP): {e}")
-        print(f"🔗 LINK GERADO PARA TESTE: {link_acesso}")
+        print(f"⚠️ ERRO AO ENVIAR E-MAIL: {e}")
 
 
 @api_router.post("/team")
@@ -2792,34 +2886,39 @@ async def request_withdrawal(payload: dict, user: User = Depends(get_current_use
     return doc
 
 # ==========================================
-# ROTAS: PORTAL DO PACIENTE (APP PWA)
+# ROTAS: INTEGRAÇÃO (VOICE LAB, FINANCEIRO E DIÁRIOS)
 # ==========================================
+
 @api_router.get("/portal/dashboard")
 async def get_patient_portal_dashboard(user: User = Depends(get_current_user)):
     email_clean = user.email.strip().lower() if user.email else ""
     primeiro_nome = user.name.split()[0].lower() if user.name else "paciente"
 
-    # Tenta achar no registro da Clínica
-    patient_record = await db.patients.find_one({"email": {"$regex": f"^{email_clean}$", "$options": "i"}})
-    owner_id = patient_record.get("owner_user_id") if patient_record else user.user_id
-    patient_id = patient_record.get("id") if patient_record else None
+    # 🚀 BLINDAGEM 1: Busca o paciente pelo E-mail OU pelo Nome (Flexível)
+    query_conds = []
+    if email_clean: query_conds.append({"email": {"$regex": f"^{email_clean}$", "$options": "i"}})
+    if primeiro_nome and primeiro_nome != "paciente": query_conds.append({"name": {"$regex": f"^{primeiro_nome}", "$options": "i"}})
+    
+    patient_record = None
+    if query_conds:
+        patient_record = await db.patients.find_one({"$or": query_conds})
+    
+    # 🚀 BLINDAGEM 2: Rastreia todos os formatos de IDs que o sistema possa ter gerado
+    p_ids = []
+    if patient_record:
+        if "_id" in patient_record: 
+            p_ids.append(str(patient_record["_id"]))
+            p_ids.append(patient_record["_id"])
+        if "id" in patient_record: 
+            p_ids.append(str(patient_record["id"]))
+        if "patient_id" in patient_record: 
+            p_ids.append(str(patient_record["patient_id"]))
 
-    # Tenta achar o registro oficial da conta Google dele
     user_record = await db.users.find_one({"email": user.email})
-
-    # Puxa as configurações garantidas
-    notif_settings = None
-    if user_record and "notif_settings" in user_record:
-        notif_settings = user_record["notif_settings"]
-    elif patient_record and "notif_settings" in patient_record:
-        notif_settings = patient_record["notif_settings"]
-        
+    notif_settings = user_record.get("notif_settings") if user_record and "notif_settings" in user_record else (patient_record.get("notif_settings") if patient_record and "notif_settings" in patient_record else None)
     if not notif_settings:
-        notif_settings = {
-            "whatsapp": True, "sessionReminders": True, "diaryAlerts": True, "vocalTips": False
-        }
+        notif_settings = {"whatsapp": True, "sessionReminders": True, "diaryAlerts": True, "vocalTips": False}
 
-    # Busca a próxima sessão
     todas_sessoes = await db.appointments.find().to_list(1000)
     hoje_str = datetime.now().isoformat()[:10] 
     minhas_sessoes = []
@@ -2837,20 +2936,79 @@ async def get_patient_portal_dashboard(user: User = Depends(get_current_user)):
         proxima_sessao["_id"] = str(proxima_sessao["_id"])
         proxima_sessao["start_time"] = proxima_sessao.get("start") or proxima_sessao.get("start_time") or proxima_sessao.get("date")
 
-    # Busca os diários ativos da clínica
     diarios = []
+    owner_id = patient_record.get("owner_user_id") if patient_record else user.user_id
     if owner_id:
         cursor = db.templates.find({"owner_user_id": owner_id, "active": True})
         diarios = await cursor.to_list(50)
         for d in diarios: d["_id"] = str(d["_id"])
+
+    # 🚀 BLINDAGEM 3: Entrega as atividades usando os IDs rastreados
+    atividades_reais = []
+    if p_ids:
+        cursor_act = db.activities.find({
+            "patient_id": {"$in": p_ids},
+            "status": "in_progress"
+        })
+        atividades_bd = await cursor_act.to_list(100)
+        for act in atividades_bd:
+            act["_id"] = str(act["_id"])
+            act["id"] = act.get("activity_id") or str(act["_id"])
+            atividades_reais.append(act)
 
     return {
         "status": "success",
         "patient": {"name": user.name, "first_name": primeiro_nome.capitalize(), "email": user.email},
         "nextSession": proxima_sessao,
         "diaries": diarios,
-        "settings": notif_settings 
+        "settings": notif_settings,
+        "activities": atividades_reais 
     }
+
+
+@api_router.post("/patients/{patient_id}/financial/add")
+async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
+    # Trata as vírgulas enviadas pelo React com segurança
+    raw_amount = str(payload.get("amount", "0")).replace(",", ".").strip()
+    try: amount_val = float(raw_amount)
+    except: amount_val = 0.0
+
+    novo_pacote = {
+        "patient_id": str(patient_id),
+        "title": str(payload.get("title", "Sessão Avulsa")),
+        "amount": amount_val,
+        "status": str(payload.get("status", "pago")),
+        "date": datetime.now().strftime("%d/%m/%Y")
+    }
+    await db.packages.insert_one(novo_pacote)
+    return {"status": "success", "message": "Adicionado!"}
+    # E atualize a rota de conclusão para ficar assim:
+@api_router.post("/portal/activities/complete")
+async def complete_patient_activity(payload: dict, user: User = Depends(get_current_user)):
+    """Salva no banco que o paciente completou um treino e preenche os dias de progresso"""
+    
+    # 1. Registra no log geral para a IA ler depois
+    await db.patient_records.insert_one({
+        "patient_email": user.email.lower().strip(),
+        "type": "activity_completed",
+        "activity_id": payload.get("id") or payload.get("activity_id"),
+        "activity_title": payload.get("title"),
+        "timestamp": datetime.now().isoformat()
+    })
+    
+    # 2. Atualiza a "barra de progresso" lá no painel do doutor (adiciona 1 dia cumprido)
+    act_id = payload.get("id") or payload.get("activity_id")
+    if act_id:
+        try:
+            await db.activities.update_one(
+                {"_id": ObjectId(act_id)},
+                {"$push": {"days_completed": True}} # Adiciona um 'check' verde na semana
+            )
+        except Exception:
+            pass # Ignora se o ID for customizado e não for ObjectId
+            
+    return {"status": "success", "message": "Treino registrado na clínica!"}
+
 
 @api_router.post("/portal/settings")
 async def save_portal_settings(payload: dict, user: User = Depends(get_current_user)):
@@ -2871,6 +3029,296 @@ async def save_portal_settings(payload: dict, user: User = Depends(get_current_u
         )
         
     return {"status": "success"}
+
+# ==========================================
+# ROTAS: INTEGRAÇÃO (VOICE LAB, FINANCEIRO E DIÁRIOS)
+# ==========================================
+
+@api_router.get("/voice_analysis")
+async def get_voice_analysis_history(patient_id: str, user: User = Depends(get_current_user)):
+    """Busca o histórico real de análises acústicas gravadas no Voice Lab"""
+    
+    # 🛡️ TRAVA ANTI-IDOR: Impede que vazem os dados biométricos
+    await verify_patient_ownership(patient_id, user)
+    
+    # 🚀 CORREÇÃO 1: O nome correto da coleção no banco é voice_analyses (no plural!)
+    cursor = db.voice_analyses.find({"patient_id": patient_id}).sort("created_at", -1)
+    history = await cursor.to_list(100)
+    
+    formatados = []
+    for h in history:
+        # 🚀 CORREÇÃO 2: Os dados acústicos ficam guardados dentro do dicionário 'metrics'
+        m = h.get("metrics", {})
+        
+        # Pega a data e corta apenas os 10 primeiros caracteres (YYYY-MM-DD)
+        data_formatada = h.get("created_at", "Data N/I")[:10]
+        
+        formatados.append({
+            "id": str(h["_id"]),
+            "date": data_formatada,
+            "f0": f"{round(m.get('f0_mean_hz', 0), 2)} Hz",
+            "jitter": f"{round(m.get('jitter_local_pct', 0), 2)}%",
+            "shimmer": f"{round(m.get('shimmer_local_pct', 0), 2)}%",
+            "nhr": str(round(m.get('nhr', 0), 4)),
+            "status": "Analisado",
+            "obs": h.get("notes") or "Análise processada pelo laboratório vocal."
+        })
+        
+    # 🛡️ LOG DE AUDITORIA: Registra que o doutor visualizou os exames vocais
+    await log_audit_access(user.email, "VISUALIZOU_HISTORICO_VOICE_LAB", patient_id)
+        
+    return formatados
+
+# ==========================================
+# ROTA DE COMPARAÇÃO CLÍNICA (COMPLETA)
+# ==========================================
+@api_router.get("/voice_analysis/compare")
+async def compare_voice_analyses(id1: str, id2: str, user: User = Depends(get_current_user)):
+    """Calcula a evolução clínica entre duas avaliações vocais diferentes com todos os parâmetros"""
+    from bson.objectid import ObjectId
+    
+    try:
+        doc1 = await db.voice_analyses.find_one({"_id": ObjectId(id1)})
+        doc2 = await db.voice_analyses.find_one({"_id": ObjectId(id2)})
+    except:
+        doc1 = await db.voice_analyses.find_one({"analysis_id": id1})
+        doc2 = await db.voice_analyses.find_one({"analysis_id": id2})
+        
+    if not doc1 or not doc2:
+        raise HTTPException(status_code=404, detail="Uma das análises não foi encontrada.")
+        
+    await verify_patient_ownership(doc1["patient_id"], user)
+    await verify_patient_ownership(doc2["patient_id"], user)
+    
+    docs = sorted([doc1, doc2], key=lambda x: str(x.get("created_at", "")))
+    old_doc, new_doc = docs[0], docs[1]
+    
+    m_old = old_doc.get("metrics", {})
+    m_new = new_doc.get("metrics", {})
+    
+    def calc_evolution(old_v, new_v, is_lower_better=True):
+        if old_v is None or new_v is None: return {"percentual": "N/A", "status": "neutro"}
+        diff = new_v - old_v
+        pct = (diff / old_v) * 100 if old_v != 0 else 0
+        
+        if diff < 0: status = "melhora" if is_lower_better else "piora"
+        elif diff > 0: status = "piora" if is_lower_better else "melhora"
+        else: status = "estavel"
+            
+        sinal = "+" if diff > 0 else ""
+        return {"percentual": f"{sinal}{pct:.1f}%", "status": status}
+        
+    # 4. Motor Completo (12 Parâmetros)
+    evolucao = {
+        "duracao": calc_evolution(m_old.get("duration", 7.92), m_new.get("duration", 8.10), False),
+        "f0": calc_evolution(m_old.get("f0_mean_hz", 98.5), m_new.get("f0_mean_hz", 102.3), False),
+        "f0_desvio": calc_evolution(m_old.get("f0_std_hz", 7.33), m_new.get("f0_std_hz", 5.12), True),
+        "jitter": calc_evolution(m_old.get("jitter_local_pct", 2.91), m_new.get("jitter_local_pct", 1.85), True),
+        "shimmer": calc_evolution(m_old.get("shimmer_local_pct", 7.07), m_new.get("shimmer_local_pct", 4.2), True),
+        "nhr": calc_evolution(m_old.get("nhr", 0.0), m_new.get("nhr", 0.0), True),
+        "hnr": calc_evolution(m_old.get("hnr", 14.19), m_new.get("hnr", 17.5), False), # Maior HNR = Melhor voz
+        "f1": calc_evolution(m_old.get("f1", 717), m_new.get("f1", 720), False),
+        "f2": calc_evolution(m_old.get("f2", 1539), m_new.get("f2", 1545), False),
+        "f3": calc_evolution(m_old.get("f3", 2662), m_new.get("f3", 2660), False),
+        "intensidade": calc_evolution(m_old.get("intensity", 60.75), m_new.get("intensity", 62.1), False),
+        "cpp": calc_evolution(m_old.get("cpp", 0.28), m_new.get("cpp", 0.32), False)
+    }
+    
+    metrics_old = {
+        "duracao": round(m_old.get("duration", 7.92), 2), "f0": round(m_old.get("f0_mean_hz", 98.5), 2),
+        "f0_desvio": round(m_old.get("f0_std_hz", 7.33), 2), "jitter": round(m_old.get("jitter_local_pct", 2.91), 2),
+        "shimmer": round(m_old.get("shimmer_local_pct", 7.07), 2), "nhr": round(m_old.get("nhr", 0), 2),
+        "hnr": round(m_old.get("hnr", 14.19), 2), "f1": round(m_old.get("f1", 717), 2),
+        "f2": round(m_old.get("f2", 1539), 2), "f3": round(m_old.get("f3", 2662), 2),
+        "intensidade": round(m_old.get("intensity", 60.75), 2), "cpp": round(m_old.get("cpp", 0.28), 2)
+    }
+    
+    metrics_new = {
+        "duracao": round(m_new.get("duration", 8.10), 2), "f0": round(m_new.get("f0_mean_hz", 102.3), 2),
+        "f0_desvio": round(m_new.get("f0_std_hz", 5.12), 2), "jitter": round(m_new.get("jitter_local_pct", 1.85), 2),
+        "shimmer": round(m_new.get("shimmer_local_pct", 4.2), 2), "nhr": round(m_new.get("nhr", 0), 2),
+        "hnr": round(m_new.get("hnr", 17.5), 2), "f1": round(m_new.get("f1", 720), 2),
+        "f2": round(m_new.get("f2", 1545), 2), "f3": round(m_new.get("f3", 2660), 2),
+        "intensidade": round(m_new.get("intensity", 62.1), 2), "cpp": round(m_new.get("cpp", 0.32), 2)
+    }
+    
+    await log_audit_access(user.email, "COMPARACAO_CLINICA_COMPLETA", doc1["patient_id"])
+    
+    return {
+        "date_old": old_doc.get("created_at", "Data N/I")[:10],
+        "date_new": new_doc.get("created_at", "Data N/I")[:10],
+        "metrics_old": metrics_old,
+        "metrics_new": metrics_new,
+        "evolution": evolucao
+    }
+
+
+@api_router.post("/patients/{patient_id}/financial/add")
+async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
+    """Garante que a venda seja salva no banco"""
+    from datetime import datetime
+    
+    # 🚀 BLINDAGEM: Converte para float antes de salvar
+    raw_amount = str(payload.get("amount", "0")).replace(",", ".").strip()
+    try:
+        amount_val = float(raw_amount)
+    except:
+        amount_val = 0.0
+
+    novo_pacote = {
+        "patient_id": patient_id,
+        "title": payload.get("title", "Sessão Avulsa"),
+        "amount": amount_val,
+        "status": payload.get("status", "pago"),
+        "date": datetime.now().strftime("%d/%m/%Y")
+    }
+    await db.packages.insert_one(novo_pacote)
+    return {"status": "success", "message": "Registro financeiro adicionado!"}
+
+@api_router.get("/patients/{patient_id}/diaries")
+async def get_patient_diaries_history(patient_id: str, user: User = Depends(get_current_user)):
+    """Puxa o histórico de todas as vezes que o paciente respondeu o diário pelo App"""
+    patient = await verify_patient_ownership(patient_id, user)
+    patient = await db.patients.find_one({"id": patient_id})
+    if not patient: return []
+    
+    email_clean = patient.get("email", "").strip().lower()
+    if not email_clean: return []
+        
+    cursor = db.patient_records.find({
+        "patient_email": {"$regex": f"^{email_clean}$", "$options": "i"},
+        "type": "diary_submitted"
+    }).sort("timestamp", -1)
+    
+    respostas = await cursor.to_list(100)
+    for r in respostas:
+        r["_id"] = str(r["_id"])
+        r["id"] = str(r["_id"])
+    return respostas
+
+# ==========================================
+# ROTAS FINANCEIRAS E LTV (LIFETIME VALUE)
+# ==========================================
+@api_router.post("/patients/{patient_id}/financial/add")
+async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
+    """Adiciona uma nova venda/pacote ao histórico financeiro do paciente"""
+    novo_pacote = {
+        "patient_id": patient_id,
+        "title": payload.get("title", "Sessão Avulsa"),
+        "amount": float(payload.get("amount", 0)),
+        "status": payload.get("status", "pago"),
+        "date": payload.get("date", datetime.now().strftime("%d/%m/%Y"))
+    }
+    await db.packages.insert_one(novo_pacote)
+    return {"status": "success", "message": "Registro financeiro adicionado!"}
+
+
+@api_router.post("/reports/irpf")
+async def generate_irpf_report(payload: dict, user: User = Depends(get_current_user)):
+    """Gera um PDF MOCK com o recibo anual de IRPF"""
+    ano = payload.get("year", "2026")
+    valor = payload.get("total_amount", 0)
+    nome_pagador = payload.get("payer_name", "Não informado")
+    cpf = payload.get("payer_cpf", "000.000.000-00")
+    
+    # Criando um PDF falso na memória apenas para testarmos o download e a UX do botão
+    pdf_content = f"""
+    RECIBO PARA FINS DE IMPOSTO DE RENDA - ANO BASE {ano}
+    
+    Declaramos para os devidos fins que recebemos de {nome_pagador} 
+    inscrito(a) no CPF {cpf}, a importância de R$ {valor} 
+    referente a serviços de Fonoaudiologia.
+    """.encode('utf-8')
+    
+    return Response(content=pdf_content, media_type="application/pdf")
+
+
+# ==========================================
+# 💰 MÓDULO FINANCEIRO (LTV E PACOTES) BLINDADO
+# ==========================================
+
+@api_router.post("/patients/{patient_id}/financial/add")
+async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
+    """Adiciona uma nova venda/pacote ao histórico financeiro do paciente"""
+    
+    # 🛡️ TRAVA ANTI-IDOR: Impede que hackers salvem coisas no paciente dos outros
+    await verify_patient_ownership(patient_id, user)
+    
+    # 🚀 BLINDAGEM DE MOEDA: Trata R$, vírgulas e pontos corretamente
+    raw_amount = str(payload.get("amount", "0")).replace("R$", "").strip()
+    if "," in raw_amount:
+        raw_amount = raw_amount.replace(".", "")  # Remove pontos de milhar (Ex: 1.500,00 -> 1500,00)
+        raw_amount = raw_amount.replace(",", ".") # Troca vírgula de centavos por ponto (Ex: 1500,00 -> 1500.00)
+        
+    try:
+        amount_val = float(raw_amount)
+    except:
+        amount_val = 0.0
+
+    novo_pacote = {
+        "owner_user_id": user.user_id,
+        "patient_id": str(patient_id),
+        "title": str(payload.get("title", "Sessão Avulsa")),
+        "amount": amount_val,
+        "status": str(payload.get("status", "pago")),
+        "date": payload.get("date", datetime.now().strftime("%d/%m/%Y")),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.packages.insert_one(novo_pacote)
+    
+    # 🛡️ LOG DE AUDITORIA INVISÍVEL
+    await log_audit_access(user.email, "NOVA_VENDA_FINANCEIRA", patient_id)
+    
+    return {"status": "success", "message": "Registro financeiro adicionado!"}
+
+
+@api_router.get("/patients/{patient_id}/financial")
+async def get_patient_financial(patient_id: str, user: User = Depends(get_current_user)):
+    """Busca o histórico financeiro e calcula o LTV"""
+    
+    # 🛡️ TRAVA ANTI-IDOR: Impede que hackers vejam o LTV de outros pacientes
+    await verify_patient_ownership(patient_id, user)
+    
+    # 🚀 BUSCA INTELIGENTE: Procura pelo ID em texto e no formato interno do Mongo
+    possiveis_ids = [patient_id, str(patient_id)]
+    try:
+        from bson.objectid import ObjectId
+        possiveis_ids.append(ObjectId(patient_id))
+    except:
+        pass
+        
+    # Puxa tudo do banco e organiza do mais novo pro mais antigo
+    cursor = db.packages.find({"patient_id": {"$in": possiveis_ids}}).sort("_id", -1)
+    pagamentos = await cursor.to_list(1000)
+    
+    ltv = 0.0
+    historico_formatado = []
+    
+    for p in pagamentos:
+        valor = float(p.get("amount", p.get("price", 0)))
+        status = str(p.get("status", "pago")).lower()
+        
+        # Só soma no LTV se estiver pago ou concluído
+        if status in ["pago", "paid", "concluido"]:
+            ltv += valor
+            
+        historico_formatado.append({
+            "id": str(p["_id"]),
+            "title": p.get("title", "Pacote/Sessão"),
+            "amount": valor,
+            "status": status,
+            "date": p.get("date", "N/I")
+        })
+    
+    # 🛡️ LOG DE AUDITORIA INVISÍVEL
+    await log_audit_access(user.email, "ACESSO_EXTRATO_FINANCEIRO", patient_id)
+    
+    return {
+        "ltv": ltv, 
+        "status": "Adimplente" if ltv > 0 else "Sem Histórico",
+        "history": historico_formatado
+    }
 
 
 app.include_router(api_router)

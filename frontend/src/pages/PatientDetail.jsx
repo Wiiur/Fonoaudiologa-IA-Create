@@ -5,19 +5,19 @@ import api from "@/lib/api";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 
-// Importação de Ícones
+// Importação de Ícones (Adicionado Wallet para o Financeiro)
 import { 
   ArrowLeft, Activity, Link as LinkIcon, MessageSquare, FileText, User, 
-  Phone, Target, Lock, CheckCircle2, XCircle, FileClock, Paperclip, BarChart, 
+  Phone, Target, Lock, CheckCircle2, XCircle, X, FileClock, Paperclip, BarChart, 
   UploadCloud, File, Image as ImageIcon, Music, Video, Trash2, Download,
   Folder, FolderPlus, FolderOpen, ChevronRight, Eye, Plus, Home, Stethoscope, 
   CheckSquare, Calendar, Award, Sparkles, LayoutTemplate, Wand2, Save, FileDown, 
   Bot, PenTool, ClipboardList, ClipboardEdit, RotateCcw, Share2, BrainCircuit, 
-  Mic, AlertCircle, ExternalLink, AudioLines, DollarSign, Receipt, TrendingUp, ShieldAlert 
+  Mic, AlertCircle, ExternalLink, AudioLines, DollarSign, Receipt, TrendingUp, ShieldAlert, Smartphone, Wallet, Table2, Info, HelpCircle
 } from 'lucide-react';
 
 // Importações do Editor de Texto Rico (Laudos)
@@ -29,7 +29,7 @@ export default function PatientDetail() {
   const queryClient = useQueryClient(); 
   
   // ==========================================
-  // ESTADOS GERAIS DA INTERFACE
+  // BLOCO 1: ESTADOS GERAIS DA INTERFACE
   // ==========================================
   const [activeTab, setActiveTab] = useState("overview");
   const [msgOpen, setMsgOpen] = useState(false);
@@ -42,7 +42,7 @@ export default function PatientDetail() {
   });
 
   // ==========================================
-  // ESTADOS DOS PROTOCOLOS E QUESTIONÁRIOS
+  // BLOCO 2: ESTADOS DOS PROTOCOLOS E QUESTIONÁRIOS
   // ==========================================
   const [protocolsState, setProtocolsState] = useState({
     qvv: null, capeV: null, idv10: null, esv: null
@@ -122,7 +122,7 @@ export default function PatientDetail() {
   };
 
   // ==========================================
-  // ESTADOS DE PASTAS E ANEXOS
+  // BLOCO 3: ESTADOS DE PASTAS E ANEXOS
   // ==========================================
   const [currentFolder, setCurrentFolder] = useState(null);
   const [isFolderModalOpen, setIsFolderModalOpen] = useState(false);
@@ -130,7 +130,7 @@ export default function PatientDetail() {
   const [previewFile, setPreviewFile] = useState(null);
 
   // ==========================================
-  // ESTADOS DE ATIVIDADES E MENSAGENS IA
+  // BLOCO 4: ESTADOS DE ATIVIDADES E MENSAGENS IA
   // ==========================================
   const [isActivityModalOpen, setIsActivityModalOpen] = useState(false);
   const [isGeneratingAi, setIsGeneratingAi] = useState(false);
@@ -141,7 +141,7 @@ export default function PatientDetail() {
   const [msgType, setMsgType] = useState("lembrete");
 
   // ==========================================
-  // ESTADOS DE RELATÓRIOS E AUDITORIA CLÍNICA
+  // BLOCO 5: ESTADOS DE RELATÓRIOS E AUDITORIA CLÍNICA
   // ==========================================
   const [isReportEditorOpen, setIsReportEditorOpen] = useState(false);
   const [isAiThinking, setIsAiThinking] = useState(false);
@@ -165,23 +165,64 @@ export default function PatientDetail() {
   };
 
   // ==========================================
-  // DADOS MOCKADOS (Voice Lab) & FISCAL
+  // BLOCO 6: ESTADOS DA INTELIGÊNCIA E FINANCEIRO
   // ==========================================
-  const mockVoiceHistory = [
-    { id: 1, date: "15/08/2026", f0: "110 Hz", jitter: "1.2%", shimmer: "3.5%", nhr: "0.15", status: "alterado", obs: "Soprosidade e instabilidade presentes." },
-    { id: 2, date: "22/08/2026", f0: "115 Hz", jitter: "0.8%", shimmer: "2.1%", nhr: "0.11", status: "melhora", obs: "Redução do Jitter e Shimmer." }
-  ];
   const [showAllRecords, setShowAllRecords] = useState(false);
-
   const [isIrpfModalOpen, setIsIrpfModalOpen] = useState(false);
   const [irpfForm, setIrpfForm] = useState({ year: new Date().getFullYear().toString(), payer_name: "", payer_cpf: "", total_amount: "" });
-
-  // 👇 ADICIONE ESTA LINHA AQUI 👇
   const [aiClinicalProgress, setAiClinicalProgress] = useState(null);
+  const [financeForm, setFinanceForm] = useState({ title: "", amount: "", status: "pago" });
 
+
+  // Estados para o Voice Lab
+  const [selectedAnalyses, setSelectedAnalyses] = useState([]); // Guarda os IDs selecionados
+  
+  // Modal de Detalhes (Laudo Completo)
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+  const [selectedDetail, setSelectedDetail] = useState(null);
+  
+  // Modal de Comparação
+  const [compareModalOpen, setCompareModalOpen] = useState(false);
+  const [compareData, setCompareData] = useState(null);
+  const [isComparing, setIsComparing] = useState(false);
+
+  // Função para selecionar os cards (Máximo 2)
+  const toggleAnalysisSelection = (id) => {
+    setSelectedAnalyses((prev) => {
+      if (prev.includes(id)) return prev.filter((item) => item !== id); // Desmarca
+      if (prev.length >= 2) {
+        toast.warning("Você só pode comparar 2 análises por vez.");
+        return prev;
+      }
+      return [...prev, id]; // Marca
+    });
+  };
+
+  // Função para chamar o Python e comparar
+  const handleCompareAnalyses = async () => {
+    if (selectedAnalyses.length !== 2) return;
+    setIsComparing(true);
+    try {
+      // Chama a nossa rota matemática do FastAPI
+      const response = await api.get(`/voice_analysis/compare?id1=${selectedAnalyses[0]}&id2=${selectedAnalyses[1]}`);
+      setCompareData(response.data);
+      setCompareModalOpen(true);
+    } catch (error) {
+      console.error(error);
+      toast.error("Erro ao gerar a comparação. Verifique os dados.");
+    } finally {
+      setIsComparing(false);
+    }
+  };
+
+  // Função para abrir o Laudo Completo
+  const openAnalysisDetail = (analysis) => {
+    setSelectedDetail(analysis);
+    setDetailModalOpen(true);
+  };
 
   // ==========================================
-  // BUSCAS NO BANCO DE DADOS (USEQUERY)
+  // BLOCO 7: BUSCAS NO BANCO DE DADOS (USEQUERY)
   // ==========================================
   const { data: p } = useQuery({ queryKey: ["patient", id], queryFn: async () => (await api.get(`/patients/${id}`)).data });
   const { data: records = [] } = useQuery({ queryKey: ["records", id], queryFn: async () => (await api.get(`/records?patient_id=${id}`)).data });
@@ -189,7 +230,12 @@ export default function PatientDetail() {
   const { data: attachments = [] } = useQuery({ queryKey: ["attachments", id], queryFn: async () => (await api.get(`/attachments?patient_id=${id}`)).data });
   const { data: activities = [] } = useQuery({ queryKey: ["activities", id], queryFn: async () => (await api.get(`/activities?patient_id=${id}`)).data });
   const { data: reportsHistory = [] } = useQuery({ queryKey: ["reports", id], queryFn: async () => (await api.get(`/reports?patient_id=${id}`)).data });
+
+  // NOVAS ROTAS OFICIAIS (FINANCEIRO, VOICE LAB E DIÁRIOS)
   const { data: financialData } = useQuery({ queryKey: ["financial", id], queryFn: async () => (await api.get(`/patients/${id}/financial`)).data });
+  const { data: voiceLabHistory = [] } = useQuery({ queryKey: ["voice_analysis", id], queryFn: async () => (await api.get(`/voice_analysis?patient_id=${id}`)).data });
+  const { data: diariesHistory = [] } = useQuery({ queryKey: ["diaries_history", id], queryFn: async () => (await api.get(`/patients/${id}/diaries`)).data });
+
   const { data: dbProtocols } = useQuery({
     queryKey: ["protocols", id],
     queryFn: async () => {
@@ -199,11 +245,20 @@ export default function PatientDetail() {
   });
 
   useEffect(() => {
-    if (dbProtocols) setProtocolsState(dbProtocols);
+    if (dbProtocols) {
+      setProtocolsState(dbProtocols);
+    }
   }, [dbProtocols]);
 
+  // Atualiza o formulário de IRPF com os dados financeiros do LTV
+  useEffect(() => {
+    if (financialData?.ltv) {
+      setIrpfForm(prev => ({ ...prev, total_amount: financialData.ltv.toString(), payer_name: p?.name || "" }));
+    }
+  }, [financialData, p]);
+
   // ==========================================
-  // MUTAÇÕES (USEMUTATION) - A NOVA ARQUITETURA
+  // BLOCO 8: MUTAÇÕES (AÇÕES DE SALVAR)
   // ==========================================
 
   const saveProtocolMutation = useMutation({
@@ -277,8 +332,18 @@ export default function PatientDetail() {
     onError: () => toast.error("Erro ao deletar anexo.")
   });
 
-  const createActivityMutation = useMutation({
-    mutationFn: async (payload) => await api.post('/activities', payload),
+ const createActivityMutation = useMutation({
+    mutationFn: async (payload) => {
+      // 🚀 INJETA O STATUS "EM ANDAMENTO" E OS DIAS DA SEMANA
+      const atividadeCompleta = {
+        ...payload,
+        status: "in_progress",
+        date: new Date().toLocaleDateString('pt-BR'),
+        days_total: 7,
+        days_completed: [false, false, false, false, false, false, false]
+      };
+      return await api.post('/activities', atividadeCompleta);
+    },
     onSuccess: () => {
       toast.success("Nova atividade atribuída ao paciente!");
       setIsActivityModalOpen(false);
@@ -367,15 +432,114 @@ export default function PatientDetail() {
     onError: () => toast.error("Erro ao processar analytics.")
   });
 
+  const addFinanceRecordMutation = useMutation({ 
+    mutationFn: async (payload) => {
+      // 🚀 AQUI ESTAVA O PROBLEMA: Estávamos arrancando os pontos acidentalmente!
+      // Agora ele apenas converte a vírgula para ponto e manda pro Python de forma segura.
+      const valorCorrigido = parseFloat(payload.amount.toString().replace(",", "."));
+      return await api.post(`/patients/${id}/financial/add`, { ...payload, amount: valorCorrigido });
+    },
+    onSuccess: () => {
+      toast.success("Pagamento/Pacote registrado com sucesso!");
+      setFinanceForm({ title: "", amount: "", status: "pago" });
+      queryClient.invalidateQueries({ queryKey: ["financial", id] });
+    },
+    onError: () => toast.error("Erro ao adicionar pagamento.")
+  });
+
   // ==========================================
-  // FUNÇÕES MANIPULADORAS (HANDLERS)
+  // BLOCO 9: FUNÇÕES AUXILIARES E HANDLERS
   // ==========================================
+
+  const createInvite = async () => { 
+    try { 
+      const { data } = await api.post(`/patients/${id}/invite`, {}); 
+      const full = `${window.location.origin}${data.invite_link}`; 
+      await navigator.clipboard.writeText(full); 
+      setInviteLink(full); 
+      toast.success("Link de convite copiado"); 
+    } catch { toast.error("Erro ao gerar convite"); } 
+  };
+
+  const getFileUrl = (path) => {
+    if (!path) return "";
+    if (path.startsWith("http")) return path;
+    const baseUrl = api.defaults?.baseURL ? api.defaults.baseURL.replace(/\/api\/?$/, "") : "http://localhost:8000";
+    return `${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
+  };
+
+  const handleDownloadAttachment = async (file) => { 
+    if (!file.file_url) return; 
+    toast.info("Preparando download seguro...");
+    
+    try {
+      // 1. Usa o nosso 'api' (Axios) para fazer o download. 
+      // Isso garante que o Token de Segurança (crachá) vá junto com o pedido!
+      const response = await api.get(`/attachments/download?file_url=${encodeURIComponent(file.file_url)}&patient_id=${id}`, {
+        responseType: 'blob' // Diz ao axios que a resposta é um arquivo (Blob)
+      });
+      
+      // 2. Cria um link temporário na memória do navegador para forçar o download
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement("a");
+      link.href = url; 
+      link.setAttribute('download', file.name || "arquivo_baixado"); // Nome do arquivo
+      document.body.appendChild(link); 
+      link.click(); // Clica no link invisível
+      
+      // 3. Limpa a memória
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      
+      toast.success("Download concluído!");
+    } catch (error) {
+      console.error("Erro no download:", error);
+      toast.error("Acesso negado ou arquivo não encontrado. Você tem permissão?");
+    }
+  };
+  
+  const getFileIcon = (fileType) => { 
+    if (!fileType) return <File size={24} className="text-stone-500" />; 
+    if (fileType.includes('image')) return <ImageIcon size={24} className="text-blue-500" />; 
+    if (fileType.includes('video')) return <Video size={24} className="text-purple-500" />; 
+    if (fileType.includes('audio')) return <Music size={24} className="text-amber-500" />; 
+    if (fileType.includes('pdf')) return <FileText size={24} className="text-rose-500" />; 
+    return <File size={24} className="text-stone-500" />; 
+  };
+  
+  const renderPreviewContent = (file) => { 
+    if (!file || !file.file_url) return <p className="text-stone-500 italic">Arquivo não disponível.</p>; 
+    const realUrl = getFileUrl(file.file_url); 
+    if (file.type.includes('image')) return <img src={realUrl} alt={file.name} className="max-w-full max-h-[70vh] object-contain rounded-lg shadow-sm" />; 
+    if (file.type.includes('video')) return <video src={realUrl} controls className="max-w-full max-h-[70vh] rounded-lg shadow-sm" />; 
+    if (file.type.includes('audio')) return <audio src={realUrl} controls className="w-full max-w-md" />; 
+    if (file.type.includes('pdf')) return <iframe src={realUrl} className="w-full h-[70vh] rounded-lg shadow-sm border border-stone-200" title="PDF Preview" />; 
+    return ( 
+      <div className="text-center p-8 text-stone-500"> 
+        <File size={48} className="mx-auto mb-4 opacity-50" /> 
+        <p className="font-bold">Pré-visualização indisponível no navegador.</p> 
+        <Button onClick={() => handleDownloadAttachment(file)} className="mt-4 bg-[#D46F54] hover:bg-[#B75C46] text-white">Baixar Arquivo</Button> 
+      </div> 
+    ); 
+  };
+
+  const calculateAge = (birthDate) => { 
+    if (!birthDate) return null; 
+    const today = new Date(); const birth = new Date(birthDate); 
+    let age = today.getFullYear() - birth.getFullYear(); 
+    const monthDiff = today.getMonth() - birth.getMonth(); 
+    if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) { age--; } 
+    return age >= 0 ? age : null; 
+  };
 
   const handleGenerateProtocolLink = (key) => {
     const fakeLink = `${window.location.origin}/forms/paciente/${id}/protocolo/${key}`;
     navigator.clipboard.writeText(fakeLink).catch(()=>{});
-    if(key === 'capeV') toast.success(`Link copiado! O paciente receberá instruções para gravar os áudios pelo celular.`);
-    else toast.success(`Link copiado! Envie para o paciente preencher o ${key.toUpperCase()}.`);
+    if(key === 'capeV') {
+      toast.success(`Link copiado! O paciente receberá instruções para gravar os áudios pelo celular.`);
+    } else {
+      toast.success(`Link copiado! Envie para o paciente preencher o ${key.toUpperCase()}.`);
+    }
   };
 
   const openProtocolFillModal = (key) => {
@@ -393,7 +557,7 @@ export default function PatientDetail() {
   const handleSaveProtocol = async () => {
     setIsAiAnalyzingProtocol(true);
     try {
-      await new Promise(r => setTimeout(r, 1000)); // Simulador de Análise IA
+      await new Promise(r => setTimeout(r, 1000));
       
       let summaryText = "";
       let scoreFinal = 0;
@@ -409,15 +573,23 @@ export default function PatientDetail() {
       } else if (activeProtocolKey === 'qvv') {
         const getAns = (qNum) => protocolAnswers[`q${qNum}`] || 1; 
         
-        let brutoFisico = 0; [1, 2, 3, 6, 7, 9].forEach(q => brutoFisico += getAns(q));
-        let brutoSocio = 0; [4, 5, 8, 10].forEach(q => brutoSocio += getAns(q));
+        let brutoFisico = 0;
+        [1, 2, 3, 6, 7, 9].forEach(q => brutoFisico += getAns(q));
+        
+        let brutoSocio = 0;
+        [4, 5, 8, 10].forEach(q => brutoSocio += getAns(q));
+        
         const brutoTotal = brutoFisico + brutoSocio;
 
         const calcFisico = 100 - (((brutoFisico - 6) / 24) * 100);
         const calcSocio = 100 - (((brutoSocio - 4) / 16) * 100);
         const calcTotal = 100 - (((brutoTotal - 10) / 40) * 100);
 
-        domains = { fisico: Number(calcFisico.toFixed(1)), 'Sócio-emocional': Number(calcSocio.toFixed(1)), funcional: 0 };
+        domains = {
+          fisico: Number(calcFisico.toFixed(1)),
+          'Sócio-emocional': Number(calcSocio.toFixed(1)),
+          funcional: 0 
+        };
         scoreFinal = Number(calcTotal.toFixed(1));
         
         summaryText = `Avaliação QVV concluída. Escore Total: ${scoreFinal}%. Domínio Físico: ${domains.fisico}% | Sócio-emocional: ${domains['Sócio-emocional']}%.`;
@@ -452,11 +624,10 @@ export default function PatientDetail() {
         date: new Date().toLocaleDateString('pt-BR') 
       };
 
-      // Dispara a mutação do React Query
       saveProtocolMutation.mutate(protocolDataToSave);
-
+      
     } catch (e) {
-      toast.error("Erro interno ao calcular protocolo.");
+      toast.error("Erro ao analisar protocolo.");
     } finally {
       setIsAiAnalyzingProtocol(false);
     }
@@ -524,29 +695,57 @@ export default function PatientDetail() {
     const textoAtual = reportForm.content.toLowerCase();
     const sugestoesDaAuditoria = [];
 
-    if (textoAtual.includes("anus")) sugestoesDaAuditoria.push({ id: "sug_anus", type: "ortografia", title: "Erro Ortográfico", original: "anus", suggestion: "anos", reason: "Correção necessária." });
-    if (textoAtual.includes("sesss")) sugestoesDaAuditoria.push({ id: "sug_sess", type: "ortografia", title: "Erro de Digitação", original: "sesss", suggestion: "sessões", reason: "A palavra está incorreta." });
-    if (textoAtual.includes("cptação")) sugestoesDaAuditoria.push({ id: "sug_coap", type: "ortografia", title: "Nomenclatura Técnica", original: "cptação", suggestion: "coaptação", reason: "Termo clínico correto.", source: "SBFa", link: "https://sbfa.org.br/" });
-    if (textoAtual.includes("sussurro")) sugestoesDaAuditoria.push({ id: "sug_1", type: "cientifico", title: "Divergência Científica", original: "sussurro", suggestion: "fonação suave", reason: "Sussurro forçado gera atrito.", source: "Behlau, M.", link: "https://sbfa.org.br/" });
+    if (textoAtual.includes("anus")) {
+      sugestoesDaAuditoria.push({
+        id: "sug_anus", type: "ortografia", title: "Erro Ortográfico / Digitação",
+        original: "anus", suggestion: "anos", reason: "Correção ortográfica necessária para manter o profissionalismo.", source: null, link: null
+      });
+    }
+
+    if (textoAtual.includes("sesss")) {
+      sugestoesDaAuditoria.push({
+        id: "sug_sess", type: "ortografia", title: "Erro de Digitação Detectado",
+        original: "sesss", suggestion: "sessões", reason: "A palavra 'sesss' está incorreta. O termo correto é 'sessões'.", source: null, link: null
+      });
+    }
+
+    if (textoAtual.includes("cptação")) {
+      sugestoesDaAuditoria.push({
+        id: "sug_coap", type: "ortografia", title: "Nomenclatura Técnica Incompleta",
+        original: "cptação", suggestion: "coaptação", reason: "O termo clínico correto para o fechamento das pregas vocais é 'coaptação'.", source: "Glossário de Termos Vocais - SBFa", link: "https://sbfa.org.br/"
+      });
+    }
+
+    if (textoAtual.includes("sussurro")) {
+      sugestoesDaAuditoria.push({
+        id: "sug_1", type: "cientifico", title: "Divergência Científica Detectada",
+        original: "sussurro", suggestion: "fonação suave", reason: "O sussurro forçado gera maior atrito nas pregas vocais e contração supraglótica, sendo contraindicado em quadros tensionais.", source: "Behlau, M. Voz: O Livro do Especialista. Vol 2. Cap. 14.", link: "https://sbfa.org.br/portal22/pdf/diretrizes_voz.pdf"
+      });
+    }
 
     if (sugestoesDaAuditoria.length === 0) {
-      toast.success("O texto está excelente! Nenhuma divergência encontrada.");
+      toast.success("O texto está excelente! Nenhuma divergência científica, clínica ou ortográfica foi encontrada pela IA.");
       setReviewSuggestions(null);
-    } else {
-      setReviewSuggestions(sugestoesDaAuditoria);
-      toast.warning(`Auditoria concluída! ${sugestoesDaAuditoria.length} pontos para revisão.`);
+      setIsAiThinking(false);
+      return;
     }
+
+    setReviewSuggestions(sugestoesDaAuditoria);
+    toast.warning(`Auditoria concluída! A IA encontrou ${sugestoesDaAuditoria.length} pontos para revisão.`);
     setIsAiThinking(false);
   };
 
   const acceptSuggestion = (sug) => {
     const regex = new RegExp(sug.original, "gi");
-    setReportForm(prev => ({...prev, content: reportForm.content.replace(regex, sug.suggestion)}));
+    let novoTexto = reportForm.content.replace(regex, sug.suggestion);
+    setReportForm(prev => ({...prev, content: novoTexto}));
     setReviewSuggestions(prev => prev.filter(item => item.id !== sug.id));
-    toast.success("Correção aplicada!");
+    toast.success("Correção aplicada com sucesso!");
   };
 
-  const rejectSuggestion = (id) => setReviewSuggestions(prev => prev.filter(item => item.id !== id));
+  const rejectSuggestion = (id) => {
+    setReviewSuggestions(prev => prev.filter(item => item.id !== id));
+  };
 
   const handleExportReport = (type) => {
     const plainText = reportForm.content.replace(/<[^>]+>/g, '\n').replace(/\n\s*\n/g, '\n\n');
@@ -566,26 +765,28 @@ export default function PatientDetail() {
     
     try {
       await new Promise(resolve => setTimeout(resolve, 2500));
+      
       const queixaPaciente = p?.chief_complaint || "desconforto vocal";
       const tituloExercicio = activityForm.title.toLowerCase();
       
-      let passoAPasso = ""; let baseCientifica = "";
+      let passoAPasso = "";
+      let baseCientifica = "";
 
       if (tituloExercicio.includes("tubo") || tituloExercicio.includes("canudo") || tituloExercicio.includes("etvso")) {
-        passoAPasso = `1. Pegue um canudo.\n2. Coloque o tubo na boca.\n3. Respire fundo pelo nariz.\n4. Solte o ar fazendo "U".\n5. Você deve sentir uma leve trepidação.\n6. Duração: 10 vezes.`;
-        baseCientifica = `Exercícios de Trato Vocal Semi-Ocluído (ETVSO). Aumenta a impedância do trato vocal.`;
-      } else if (tituloExercicio.includes("vibração") || tituloExercicio.includes("lingua") || tituloExercicio.includes("lábio")) {
-        passoAPasso = `1. Sente-se relaxado.\n2. Puxe o ar de forma tranquila.\n3. Faça os lábios vibrarem ("brrrrrr").\n4. Tente manter a vibração constante.\n5. Se travar, não faça força.\n6. Duração: 3 minutos.`;
-        baseCientifica = `Técnica de Vibração Sonorizada. Atua na mobilização da mucosa.`;
+        passoAPasso = `1. Pegue um canudo de espessura média.\n2. Coloque o tubo na boca e feche bem os lábios ao redor dele, garantindo que o ar não vaze pelos cantos.\n3. Respire fundo pelo nariz de forma natural, sentindo a barriga expandir sem levantar os ombros.\n4. Solte o ar fazendo o som de um "U" prolongado dentro do tubo.\n5. O segredo do exercício: Você deve sentir uma leve trepidação ou formigamento nos lábios. Isso indica que a energia do som está ressoando no lugar certo (na boca), tirando o "peso" da sua garganta!\n6. Duração: Mantenha o som de forma confortável e contínua até o fôlego quase acabar. Descanse 5 segundos e repita por 10 vezes.`;
+        baseCientifica = `Fundamentado nos preceitos de Exercícios de Trato Vocal Semi-Ocluído (ETVSO). A técnica aumenta a impedância do trato vocal, reduzindo o impacto colisional glótico e favorecendo o reequilíbrio miofuncional.\nFonte: Titze IR. Voice training and therapy with a semi-occluded vocal tract. (PubMed)\nLink: https://pubmed.ncbi.nlm.nih.gov/16572589/`;
+      } else if (tituloExercicio.includes("vibração") || tituloExercicio.includes("lingua") || tituloExercicio.includes("lábio") || tituloExercicio.includes("labio")) {
+        passoAPasso = `1. Sente-se ou fique em pé com a postura relaxada. Solte bem o pescoço e a fisionomia do rosto.\n2. Puxe o ar de forma tranquila pelo nariz.\n3. Una os lábios de forma bem leve e solte o ar fazendo-os vibrar continuamente (som de "brrrrrr").\n4. O segredo do exercício: Tente manter a vibração constante, lisa, sem que o som falhe no meio. Imagine o som saindo contínuo como o motor de um barquinho.\n5. Se a vibração travar, não faça força! Pare, engula saliva, relaxe o rosto e tente de novo.\n6. Duração: Mantenha a vibração por cerca de 5 a 8 segundos. Descanse um pouco e repita por 3 minutos no total.`;
+        baseCientifica = `Técnica de Vibração Sonorizada de Lábios/Língua. Atua na mobilização da mucosa das pregas vocais, reduzindo a constrição supraglótica e melhorando a coaptação glótica.\nFonte: Behlau M, et al. Voz: O Livro do Especialista. Vol 2. Cap 14.\nLink: https://sbfa.org.br/`;
       } else {
-        passoAPasso = `1. Posicione-se confortavelmente.\n2. Inicie suavemente.\n3. Foque na vibração da "máscara".\n4. Mantenha a garganta relaxada.\n5. Duração: 3 séries de 1 minuto.`;
-        baseCientifica = `Técnica de ampliação de ressonância.`;
+        passoAPasso = `1. Posicione-se confortavelmente, em um ambiente silencioso.\n2. Inicie a execução do exercício de forma suave. O som deve começar fácil, solto e sem nenhum "aperto" no pescoço.\n3. Foque a sua atenção na vibração do som ocorrendo na região da "máscara" do rosto (lábios e nariz), e não na garganta.\n4. Tente manter a garganta relaxada e o espaço interno da boca amplo.\n5. Duração: Realize o exercício em 3 séries de 1 minuto. Faça pausas de 30 segundos entre as séries para beber um gole de água.`;
+        baseCientifica = `Técnica focada no condicionamento e adequação do fechamento glótico, visando a ampliação do espaço de ressonância e diminuição de esforço global.\nFonte: Consenso em Terapia de Voz - Tratado de Fonoaudiologia (SBFa).\nLink: https://sbfa.org.br/`;
       }
 
-      const instrucoesGeradas = `🎯 OBJETIVO DO EXERCÍCIO: ${activityForm.title}\n\n📝 COMO EXECUTAR:\n${passoAPasso}\n\n⚠️ ATENÇÃO EXCLUSIVA:\nComo seu relato foi "${queixaPaciente}", a regra é leveza e zero esforço.\n\n📚 BASE CIENTÍFICA:\n${baseCientifica}`;
+      const instrucoesGeradas = `🎯 OBJETIVO DO EXERCÍCIO: ${activityForm.title}\n\n📝 COMO EXECUTAR (Passo a Passo detalhado):\n${passoAPasso}\n\n⚠️ ATENÇÃO EXCLUSIVA PARA O SEU CASO:\nComo o seu relato principal no início foi "${queixaPaciente}", a regra de ouro é: leveza e zero esforço. O exercício deve parecer uma "massagem" nas cordas vocais. Se você sentir a garganta raspando, doendo, ou se a voz falhar e ficar mais rouca durante a execução, PARE imediatamente.\n\n📚 BASE CIENTÍFICA (Registro Clínico):\n${baseCientifica}`;
       
       setActivityForm(prev => ({ ...prev, description: instrucoesGeradas }));
-      toast.success("Copiloto gerou instruções detalhadas!");
+      toast.success("O Copiloto gerou instruções detalhadas baseadas no tipo de exercício!");
     } catch (error) { toast.error("Erro ao conectar com a IA."); } finally { setIsGeneratingAi(false); }
   };
 
@@ -593,23 +794,32 @@ export default function PatientDetail() {
     setIsAiDraftingMsg(true);
     try {
       await new Promise(r => setTimeout(r, 1500));
+      
       const nomePrimeiro = p?.name.split(' ')[0] || "Paciente";
       let text = `Olá, ${nomePrimeiro}! Tudo bem?\n\nAqui é da clínica fonoaudiológica.\n`;
       
       if (msgType === 'lembrete') {
         const atividadePendente = activities.find(a => a.status === 'in_progress');
-        if (atividadePendente) text += `Passando para lembrar dos nossos exercícios de "${atividadePendente.title}". Conseguiu fazer? Lembre-se da nossa regra: faça tudo sem esforço, ok?`;
-        else text += `Passando para lembrar de manter os cuidados com a voz e a hidratação!`;
+        if (atividadePendente) {
+          text += `Passando para lembrar dos nossos exercícios de "${atividadePendente.title}" dessa semana. Conseguiu fazer? Lembre-se da nossa regra: faça tudo sem esforço e respeite o seu limite, ok?`;
+        } else {
+          text += `Passando para lembrar de manter os cuidados com a voz e a hidratação que conversamos na nossa última sessão! Como tem sido a semana?`;
+        }
       } else if (msgType === 'retorno') {
-        text += `Passando para saber como está a sua voz após a nossa última sessão. Sentiu melhora na queixa de "${p?.chief_complaint}"?`;
+        text += `Passando para saber como está a sua voz após a nossa última sessão. Sentiu alguma melhora na queixa de "${p?.chief_complaint}"?`;
       } else if (msgType === 'agendamento') {
-        text += `Passando apenas para confirmar nossa próxima sessão de fonoterapia. Podemos manter o horário?`;
+        text += `Passando apenas para confirmar nossa próxima sessão de fonoterapia. Podemos manter o horário agendado?`;
       }
       
-      text += `\n\nQualquer dúvida, estou à disposição!`;
+      text += `\n\nQualquer dúvida ou desconforto, estou à disposição por aqui!`;
+      
       setWhatsappMsg(text);
-      toast.success("Mensagem gerada com sucesso!");
-    } catch (e) { toast.error("Erro ao gerar mensagem."); } finally { setIsAiDraftingMsg(false); }
+      toast.success("Mensagem focada gerada com sucesso!");
+    } catch (e) {
+      toast.error("Erro ao gerar mensagem.");
+    } finally {
+      setIsAiDraftingMsg(false);
+    }
   };
 
   const copyWhatsAppMsg = () => {
@@ -617,45 +827,6 @@ export default function PatientDetail() {
     toast.success("Copiado! Basta colar no WhatsApp.");
     setMsgOpen(false);
   };
-
-  const createInvite = async () => { try { const { data } = await api.post(`/patients/${id}/invite`, {}); const full = `${window.location.origin}${data.invite_link}`; await navigator.clipboard.writeText(full); setInviteLink(full); toast.success("Link de convite copiado"); } catch { toast.error("Erro ao gerar convite"); } };
-  
-  const getFileUrl = (path) => {
-    if (!path) return "";
-    if (path.startsWith("http")) return path;
-    const baseUrl = api.defaults?.baseURL ? api.defaults.baseURL.replace(/\/api\/?$/, "") : "http://localhost:8000";
-    return `${baseUrl.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
-  };
-
-  const handleDownloadAttachment = (file) => { 
-    if (!file.file_url) return; 
-    toast.info("Iniciando download...");
-    const baseUrl = api.defaults?.baseURL ? api.defaults.baseURL.replace(/\/api\/?$/, "") : "http://localhost:8000";
-    const downloadUrl = `${baseUrl}/api/attachments/download?file_url=${encodeURIComponent(file.file_url)}`;
-    const link = document.createElement("a");
-    link.href = downloadUrl; link.target = "_self";
-    document.body.appendChild(link); link.click(); document.body.removeChild(link);
-  };
-  
-  const getFileIcon = (fileType) => { if (!fileType) return <File size={24} className="text-stone-500" />; if (fileType.includes('image')) return <ImageIcon size={24} className="text-blue-500" />; if (fileType.includes('video')) return <Video size={24} className="text-purple-500" />; if (fileType.includes('audio')) return <Music size={24} className="text-amber-500" />; if (fileType.includes('pdf')) return <FileText size={24} className="text-rose-500" />; return <File size={24} className="text-stone-500" />; };
-  
-  const renderPreviewContent = (file) => { 
-    if (!file || !file.file_url) return <p className="text-stone-500 italic">Arquivo não disponível.</p>; 
-    const realUrl = getFileUrl(file.file_url); 
-    if (file.type.includes('image')) return <img src={realUrl} alt={file.name} className="max-w-full max-h-[70vh] object-contain rounded-lg shadow-sm" />; 
-    if (file.type.includes('video')) return <video src={realUrl} controls className="max-w-full max-h-[70vh] rounded-lg shadow-sm" />; 
-    if (file.type.includes('audio')) return <audio src={realUrl} controls className="w-full max-w-md" />; 
-    if (file.type.includes('pdf')) return <iframe src={realUrl} className="w-full h-[70vh] rounded-lg shadow-sm border border-stone-200" title="PDF Preview" />; 
-    return ( 
-      <div className="text-center p-8 text-stone-500"> 
-        <File size={48} className="mx-auto mb-4 opacity-50" /> 
-        <p className="font-bold">Pré-visualização indisponível no navegador.</p> 
-        <Button onClick={() => handleDownloadAttachment(file)} className="mt-4 bg-[#D46F54] hover:bg-[#B75C46] text-white">Baixar Arquivo</Button> 
-      </div> 
-    ); 
-  };
-
-  const calculateAge = (birthDate) => { if (!birthDate) return null; const today = new Date(); const birth = new Date(birthDate); let age = today.getFullYear() - birth.getFullYear(); const monthDiff = today.getMonth() - birth.getMonth(); if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) { age--; } return age >= 0 ? age : null; };
 
   if (!p) return <div className="flex items-center justify-center h-screen text-stone-500 animate-pulse font-medium">Carregando prontuário...</div>;
   const displayAge = p.age ?? calculateAge(p.birth_date);
@@ -725,6 +896,7 @@ export default function PatientDetail() {
           { id: "voicelab", label: "Análise Vocal (Lab)", icon: AudioLines },
           { id: "soap", label: "Evoluções (SOAP)", icon: FileClock },
           { id: "activities", label: "Atividades/Desafios", icon: Award },
+          { id: "financial", label: "Financeiro & Pacotes", icon: Wallet },
           { id: "exams", label: "Exames/Anexos", icon: Paperclip },
           { id: "reports", label: "Relatórios", icon: LayoutTemplate },
           { id: "intelligence", label: "Inteligência & Fiscal", icon: BrainCircuit, isRestricted: true },
@@ -737,6 +909,99 @@ export default function PatientDetail() {
       </div>
 
       <div className="pt-2">
+
+        {/* ========================================== */}
+        {/* NOVA ABA: FINANCEIRO                       */}
+        {/* ========================================== */}
+        {activeTab === "financial" && (
+          <div className="max-w-5xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4">
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+              <div className="bg-emerald-50 rounded-3xl p-6 border border-emerald-100 flex flex-col justify-center">
+                <div className="text-[11px] font-bold text-emerald-600 uppercase tracking-widest mb-1 flex items-center gap-2">
+                  <DollarSign size={14}/> Lifetime Value (LTV)
+                </div>
+                <div className="font-heading text-3xl sm:text-4xl font-bold text-emerald-800">
+                  R$ {financialData?.ltv?.toLocaleString('pt-BR', { minimumFractionDigits: 2 }) || "0,00"}
+                </div>
+                <p className="text-xs text-emerald-700/80 mt-2 font-medium">Soma de todos os pacotes e sessões já pagos por este paciente.</p>
+              </div>
+              
+              <div className="bg-white rounded-3xl p-6 border border-stone-200 shadow-sm">
+                <h3 className="text-sm font-bold text-stone-800 mb-4 flex items-center gap-2">
+                  <Plus size={16} className="text-[#D46F54]" /> Lançar Nova Venda
+                </h3>
+                <form onSubmit={(e) => {
+                  e.preventDefault();
+                  if(!financeForm.title || !financeForm.amount) return toast.error("Preencha o título e o valor.");
+                  
+                  // Converte a vírgula para ponto antes de mandar pro banco
+                  const valorCorrigido = parseFloat(financeForm.amount.toString().replace(",", "."));
+                  
+                  addFinanceRecordMutation.mutate({
+                    ...financeForm,
+                    amount: valorCorrigido
+                  });
+                }} className="space-y-4">
+                  <div>
+                    <label className="text-xs font-bold text-stone-500 mb-1 block">Referência (Ex: Pacote 10 Sessões, Avulsa)</label>
+                    <Input placeholder="Título da cobrança" value={financeForm.title} onChange={e => setFinanceForm({...financeForm, title: e.target.value})} className="h-10 bg-stone-50"/>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs font-bold text-stone-500 mb-1 block">Valor (R$)</label>
+                      <Input type="number" placeholder="Ex: 1500.00" value={financeForm.amount} onChange={e => setFinanceForm({...financeForm, amount: e.target.value})} className="h-10 bg-stone-50"/>
+                    </div>
+                    <div>
+                      <label className="text-xs font-bold text-stone-500 mb-1 block">Status</label>
+                      <Select value={financeForm.status} onValueChange={(val) => setFinanceForm({...financeForm, status: val})}>
+                        <SelectTrigger className="w-full bg-stone-50 h-10 border-stone-200"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="pago">Pago</SelectItem>
+                          <SelectItem value="pendente">Pendente</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  <Button type="submit" disabled={addFinanceRecordMutation.isPending} className="w-full bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold h-10">
+                    {addFinanceRecordMutation.isPending ? "Lançando..." : "Registrar Venda"}
+                  </Button>
+                </form>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-3xl p-6 border border-stone-200 shadow-sm flex flex-col min-h-[300px]">
+              <h3 className="text-sm font-bold text-stone-800 mb-4 flex items-center gap-2">
+                <Receipt size={16} className="text-stone-400" /> Extrato Financeiro
+              </h3>
+              
+              {!financialData || !financialData.history || financialData.history.length === 0 ? (
+                <div className="text-center py-12 text-stone-400 italic bg-stone-50 rounded-xl border border-dashed border-stone-200 mt-auto mb-auto">
+                  Nenhum registro financeiro encontrado.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {financialData.history.map((record) => (
+                    <div key={record.id} className="flex justify-between items-center bg-stone-50 p-4 rounded-2xl border border-stone-100 hover:border-stone-200 transition-colors">
+                      <div>
+                        <h4 className="font-bold text-stone-800 text-sm">{record.title}</h4>
+                        <p className="text-[10px] text-stone-400 font-bold uppercase tracking-wider">{record.date}</p>
+                      </div>
+                      <div className="text-right">
+                        <p className="font-bold text-stone-800 text-lg">R$ {record.amount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+                        <span className={`inline-block px-2 py-0.5 text-[9px] font-bold uppercase tracking-widest rounded-md mt-1 ${record.status === 'pago' || record.status === 'concluido' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                          {record.status}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+          </div>
+        )}
+
         {/* ========================================== */}
         {/* ABA: INTELIGÊNCIA & FISCAL                 */}
         {/* ========================================== */}
@@ -772,7 +1037,7 @@ export default function PatientDetail() {
                     <div className="bg-stone-50 border border-stone-100 rounded-2xl p-4">
                       <div className="text-[10px] font-bold text-stone-500 uppercase tracking-widest mb-1">Status Atual</div>
                       <div className="font-heading text-lg font-bold text-stone-700 mt-1 flex items-center gap-1.5">
-                        <CheckCircle2 size={16} className="text-emerald-500"/> Adimplente
+                        <CheckCircle2 size={16} className="text-emerald-500"/> {financialData?.status || "Adimplente"}
                       </div>
                     </div>
                   </div>
@@ -820,7 +1085,7 @@ export default function PatientDetail() {
                         <div className="flex items-center gap-2 text-indigo-700 mb-3 border-b border-indigo-100 pb-3">
                           <Sparkles size={16} /> <h4 className="font-bold text-sm">Resumo Sistêmico do Paciente</h4>
                         </div>
-                        <p className="text-sm text-stone-700 leading-relaxed font-medium">
+                        <p className="text-sm text-stone-700 leading-relaxed font-medium whitespace-pre-wrap">
                           {aiClinicalProgress}
                         </p>
                       </div>
@@ -858,7 +1123,7 @@ export default function PatientDetail() {
                   <p><span className="font-bold">Responsável:</span> {p.has_responsible ? `${p.responsible?.name} (${p.responsible?.relationship})` : "N/A"}</p>
                 </div>
               </div>
-              <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
+              <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm flex flex-col">
                 <h3 className="text-xs uppercase tracking-widest text-stone-500 font-bold mb-4">Queixa e Contexto</h3>
                 <p className="text-sm text-stone-700 italic">"{p.chief_complaint}"</p>
                 <div className="mt-4 pt-4 border-t border-stone-100 space-y-2 text-sm text-stone-700">
@@ -867,6 +1132,34 @@ export default function PatientDetail() {
                 </div>
               </div>
             </div>
+
+            {/* O CARD DE DIÁRIOS REAIS DO PWA AQUI */}
+            {diariesHistory.length > 0 && (
+              <div className="bg-gradient-to-r from-rose-50 to-white border border-rose-200 rounded-2xl p-6 shadow-sm">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-xs uppercase tracking-widest text-rose-700 font-bold flex items-center gap-2">
+                    <Smartphone size={16}/> Monitoramento App Paciente (Diários)
+                  </h3>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                  {diariesHistory.slice(0, 3).map(diary => {
+                    const avgScore = diary.answers ? (Object.values(diary.answers).reduce((a,b)=>Number(a)+Number(b),0) / Object.keys(diary.answers).length).toFixed(1) : "-";
+                    return (
+                      <div key={diary.id} className="bg-white border border-rose-100 rounded-xl p-4 shadow-sm flex flex-col justify-between hover:border-rose-300 transition-colors">
+                        <div>
+                          <p className="text-[10px] text-stone-400 font-bold uppercase mb-1">{new Date(diary.timestamp).toLocaleDateString('pt-BR')} às {new Date(diary.timestamp).toLocaleTimeString('pt-BR', {hour: '2-digit', minute:'2-digit'})}</p>
+                          <h4 className="font-bold text-stone-800 text-sm mb-2 leading-tight">{diary.diary_title}</h4>
+                        </div>
+                        <div className="flex items-center justify-between mt-2 pt-2 border-t border-stone-50">
+                          <span className="text-xs text-stone-500 font-medium">Média Reportada:</span>
+                          <span className={`text-xs font-bold px-2 py-1 rounded ${avgScore > 6 ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'}`}>{avgScore} / 10</span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
 
             <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
               <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 mb-6">
@@ -959,7 +1252,7 @@ export default function PatientDetail() {
                 <h3 className="font-bold text-stone-800 text-lg flex items-center gap-2">
                   <AudioLines size={20} className="text-[#D46F54]" /> Histórico de Análise Acústica
                 </h3>
-                <p className="text-sm text-stone-500 mt-1">Acompanhe a evolução dos parâmetros acústicos do paciente (Jitter, Shimmer, F0).</p>
+                <p className="text-sm text-stone-500 mt-1">Acompanhe a evolução dos parâmetros acústicos do paciente extraídos automaticamente do laboratório.</p>
               </div>
               <Link to={`/voice-lab?patient_id=${id}`}>
                 <Button className="bg-[#D46F54] hover:bg-[#B75C46] text-white shrink-0 shadow-md w-full sm:w-auto">
@@ -968,57 +1261,95 @@ export default function PatientDetail() {
               </Link>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {mockVoiceHistory.map((item) => (
-                <div key={item.id} className="bg-white border border-stone-200 rounded-2xl p-5 shadow-sm hover:shadow-md transition-shadow flex flex-col h-full">
-                  <div className="flex justify-between items-start mb-4">
-                    <div className="flex items-center gap-3">
-                      <div className={`p-2.5 rounded-xl ${item.status === 'melhora' ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
-                        <AudioLines size={20} />
-                      </div>
-                      <div>
-                        <h4 className="font-bold text-stone-800 text-sm">Análise Acústica</h4>
-                        <p className="text-[10px] text-stone-400 font-bold uppercase tracking-wider">{item.date}</p>
-                      </div>
-                    </div>
-                    <span className={`px-2.5 py-1 text-[10px] font-bold uppercase rounded-md ${item.status === 'melhora' ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}>
-                      {item.status === 'melhora' ? 'Melhora' : 'Atenção'}
-                    </span>
-                  </div>
+            {/* 👇 Usando voiceLabHistory aqui */}
+            {voiceLabHistory.length === 0 ? (
+              <div className="bg-stone-50 border-2 border-dashed border-stone-200 rounded-2xl p-10 text-center">
+                <AudioLines size={40} className="text-stone-300 mx-auto mb-3" />
+                <h4 className="font-bold text-stone-600 mb-1">Nenhuma gravação encontrada</h4>
+                <p className="text-sm text-stone-500 mb-4">Acesse o Voice Lab para capturar e processar o primeiro áudio deste paciente.</p>
+                <Link to={`/voice-lab?patient_id=${id}`}>
+                  <Button variant="outline" className="border-stone-300 text-stone-700">Acessar Laboratório Vocal</Button>
+                </Link>
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-6">
+                  {/* 👇 E usando voiceLabHistory aqui também! Sem chance de erro agora! */}
+                  {voiceLabHistory.map((item) => {
+                    const isSelected = selectedAnalyses.includes(item.id);
+                    
+                    return (
+                      <div 
+                        key={item.id} 
+                        className={`border p-5 rounded-2xl relative transition-all ${
+                          isSelected ? 'border-[#D46F54] bg-[#F3E7E4] shadow-md' : 'border-gray-200 bg-white hover:shadow-sm'
+                        }`}
+                      >
+                        {/* Checkbox de Seleção */}
+                        <div className="absolute top-5 right-5 flex items-center gap-2">
+                          {isSelected && <span className="text-xs font-bold text-[#D46F54]">Selecionado</span>}
+                          <input 
+                            type="checkbox" 
+                            className="w-5 h-5 accent-[#D46F54] cursor-pointer"
+                            checked={isSelected}
+                            onChange={() => toggleAnalysisSelection(item.id)}
+                          />
+                        </div>
 
-                  <div className="grid grid-cols-4 gap-2 mb-4 bg-stone-50 rounded-xl p-3 border border-stone-100">
-                    <div className="text-center">
-                      <p className="text-[10px] font-bold text-stone-500 mb-1">F0</p>
-                      <p className="text-xs font-bold text-stone-800">{item.f0}</p>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-[10px] font-bold text-stone-500 mb-1">Jitter</p>
-                      <p className="text-xs font-bold text-stone-800">{item.jitter}</p>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-[10px] font-bold text-stone-500 mb-1">Shimmer</p>
-                      <p className="text-xs font-bold text-stone-800">{item.shimmer}</p>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-[10px] font-bold text-stone-500 mb-1">NHR</p>
-                      <p className="text-xs font-bold text-stone-800">{item.nhr}</p>
-                    </div>
-                  </div>
+                        {/* Cabeçalho do Card */}
+                        <div className="flex items-center gap-3 mb-4">
+                          <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center text-red-500">
+                            <AudioLines className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-gray-800 text-sm">Gravação Processada</h3>
+                            <p className="text-xs text-gray-500">{item.date}</p>
+                          </div>
+                        </div>
 
-                  <div className="flex-1 mb-4">
-                    <p className="text-xs text-stone-600 leading-relaxed"><strong className="text-stone-800">Obs:</strong> {item.obs}</p>
-                  </div>
-                  
-                  <div className="mt-auto flex justify-end pt-3 border-t border-stone-100">
-                    <Button variant="ghost" className="text-xs text-[#D46F54] hover:text-[#B75C46] hover:bg-[#F3E7E4]/50 h-8">
-                      Ver Espectrograma <ChevronRight size={14} className="ml-1" />
-                    </Button>
-                  </div>
+                        {/* Caixinha Cinza com os Números */}
+                        <div className="bg-gray-50 rounded-xl p-3 flex justify-between text-center mb-4">
+                          <div><p className="text-[10px] text-gray-500 font-bold uppercase">F0</p><p className="text-sm font-bold">{item.f0}</p></div>
+                          <div><p className="text-[10px] text-gray-500 font-bold uppercase">Jitter</p><p className="text-sm font-bold">{item.jitter}</p></div>
+                          <div><p className="text-[10px] text-gray-500 font-bold uppercase">Shimmer</p><p className="text-sm font-bold">{item.shimmer}</p></div>
+                          <div><p className="text-[10px] text-gray-500 font-bold uppercase">NHR</p><p className="text-sm font-bold">{item.nhr}</p></div>
+                        </div>
+
+                        <div className="flex justify-between items-center">
+                          <p className="text-xs text-gray-500 truncate max-w-[70%]"><b>Obs:</b> {item.obs}</p>
+                          <button 
+                            onClick={() => openAnalysisDetail(item)}
+                            className="text-xs font-bold text-[#D46F54] hover:underline"
+                          >
+                            Ver Laudo Completo
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
-              ))}
-            </div>
+
+                {/* Botão Flutuante */}
+                {selectedAnalyses.length > 0 && (
+                  <div className="fixed bottom-10 left-1/2 transform -translate-x-1/2 bg-gray-900 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-4 z-50">
+                    <span className="text-sm font-medium">{selectedAnalyses.length} / 2 selecionados</span>
+                    {selectedAnalyses.length === 2 && (
+                      <button 
+                        onClick={handleCompareAnalyses}
+                        disabled={isComparing}
+                        className="bg-[#D46F54] hover:bg-[#B75C46] px-4 py-1.5 rounded-full text-sm font-bold transition-colors"
+                      >
+                        {isComparing ? "Calculando..." : "Comparar Evolução"}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
           </div>
         )}
+
+        
 
         {/* ========================================== */}
         {/* ABA: EVOLUÇÕES (SOAP)                      */}
@@ -1314,10 +1645,13 @@ export default function PatientDetail() {
       {/* BLOCO 10: MODAIS GERAIS (SOAP E PASTAS)    */}
       {/* ========================================== */}
       <Dialog open={!!selectedRecord} onOpenChange={(open) => !open && setSelectedRecord(null)}>
-        <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto custom-scrollbar">
-          <DialogHeader className="border-b border-stone-100 pb-4"><DialogTitle className="font-heading text-2xl text-stone-800">Detalhes da Evolução</DialogTitle></DialogHeader>
+        <DialogContent className="hide-default-close max-w-3xl max-h-[85vh] overflow-y-auto custom-scrollbar bg-white rounded-[2rem] p-6">
+          <div className="flex justify-between items-center border-b pb-4 mb-4">
+            <DialogTitle className="font-heading text-2xl text-stone-800">Detalhes da Evolução</DialogTitle>
+            <button onClick={() => setSelectedRecord(null)} className="p-2 bg-stone-100 rounded-full hover:bg-stone-200"><X size={16}/></button>
+          </div>
           {selectedRecord && (
-            <div className="space-y-4 mt-4 text-sm text-stone-700">
+            <div className="space-y-4 text-sm text-stone-700">
               {selectedRecord.subjective && <p><strong>S:</strong> {selectedRecord.subjective}</p>}
               {selectedRecord.objective && <p><strong>O:</strong> {selectedRecord.objective}</p>}
               {selectedRecord.assessment && <p><strong>A:</strong> {selectedRecord.assessment}</p>}
@@ -1328,140 +1662,118 @@ export default function PatientDetail() {
       </Dialog>
 
       <Dialog open={isFolderModalOpen} onOpenChange={setIsFolderModalOpen}>
-        <DialogContent className="max-w-sm w-[90vw]">
-          <DialogHeader><DialogTitle className="font-heading">Criar Nova Pasta</DialogTitle></DialogHeader>
-          <form onSubmit={(e) => { e.preventDefault(); if (newFolderName.trim()) createFolderMutation.mutate(newFolderName); }} className="space-y-4 mt-2">
-            <div><label className="text-xs font-bold text-stone-500 mb-1 block">Nome</label><input type="text" autoFocus value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)} className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm outline-none focus:border-[#D46F54]" /></div>
-            <Button type="submit" disabled={createFolderMutation.isPending} className="w-full bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold">{createFolderMutation.isPending ? "Criando..." : "Criar Pasta"}</Button>
+        <DialogContent className="hide-default-close max-w-sm w-[90vw] bg-white rounded-[2rem] p-6">
+          <div className="flex justify-between items-center mb-4">
+            <DialogTitle className="font-heading">Criar Nova Pasta</DialogTitle>
+            <button onClick={() => setIsFolderModalOpen(false)}><X size={16}/></button>
+          </div>
+          <form onSubmit={(e) => { e.preventDefault(); if (newFolderName.trim()) createFolderMutation.mutate(newFolderName); }} className="space-y-4">
+            <input type="text" autoFocus value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)} className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm" placeholder="Nome da pasta" />
+            <Button type="submit" disabled={createFolderMutation.isPending} className="w-full bg-[#D46F54] text-white">Criar Pasta</Button>
           </form>
         </DialogContent>
       </Dialog>
-      
+
       <Dialog open={!!previewFile} onOpenChange={(open) => !open && setPreviewFile(null)}>
-        <DialogContent className="max-w-4xl max-h-[90vh] flex flex-col bg-stone-50/95 backdrop-blur-sm border-stone-200 w-[95vw]">
-          <DialogHeader className="border-b border-stone-200 pb-3 shrink-0"><DialogTitle className="font-heading text-xl text-stone-800 truncate pr-8">{previewFile?.name}</DialogTitle></DialogHeader>
-          <div className="flex-1 overflow-hidden flex items-center justify-center p-4">{renderPreviewContent(previewFile)}</div>
+        <DialogContent className="hide-default-close max-w-4xl max-h-[90vh] flex flex-col bg-stone-50/95 backdrop-blur-sm border-stone-200 w-[95vw] rounded-[2rem] p-6">
+          <div className="border-b border-stone-200 pb-3 shrink-0 flex justify-between items-center">
+             <DialogTitle className="font-heading text-xl text-stone-800 truncate pr-8">{previewFile?.name}</DialogTitle>
+             <button onClick={() => setPreviewFile(null)} className="text-stone-400 hover:text-rose-500"><X size={20}/></button>
+          </div>
+          <div className="flex-1 overflow-hidden flex items-center justify-center pt-4">{renderPreviewContent(previewFile)}</div>
         </DialogContent>
       </Dialog>
 
       <Dialog open={isActivityModalOpen} onOpenChange={setIsActivityModalOpen}>
-        <DialogContent className="max-w-lg w-[95vw] max-h-[90vh] overflow-y-auto">
-          <DialogHeader><DialogTitle className="font-heading">Atribuir Nova Atividade</DialogTitle></DialogHeader>
-          <div className="space-y-4 mt-2">
-            <div>
-              <label className="text-xs font-bold text-stone-500 mb-1 block">Título da Atividade</label>
-              <input type="text" value={activityForm.title} onChange={(e) => setActivityForm(prev => ({...prev, title: e.target.value}))} placeholder="Ex: Vibração de Língua" className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm outline-none focus:border-[#D46F54]" />
-            </div>
-            <div>
-              <label className="text-xs font-bold text-stone-500 mb-1 block">Tipo de Atividade</label>
-              <Select value={activityForm.type} onValueChange={(val) => setActivityForm(prev => ({...prev, type: val}))}>
-                <SelectTrigger className="w-full bg-stone-50 border-stone-200 rounded-xl"><SelectValue placeholder="Selecione o tipo" /></SelectTrigger>
-                <SelectContent><SelectItem value="casa">Para Casa (Diário)</SelectItem><SelectItem value="clinica">Na Clínica (Apenas registro)</SelectItem></SelectContent>
-              </Select>
-            </div>
-            <div className="relative">
-              <div className="flex justify-between items-end mb-1">
-                <label className="text-xs font-bold text-stone-500 block">Instruções</label>
-                <button type="button" onClick={handleGenerateAiInstructions} disabled={isGeneratingAi} className="text-[10px] font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50">
-                  {isGeneratingAi ? <Activity size={14} className="animate-spin" /> : <Sparkles size={14} className="text-indigo-500" />} {isGeneratingAi ? "A IA está escrevendo..." : "Gerar com IA"}
-                </button>
-              </div>
-              <Textarea value={activityForm.description} onChange={(e) => setActivityForm(prev => ({...prev, description: e.target.value}))} placeholder="Escreva as instruções ou clique em 'Gerar com IA'..." rows={6} className="bg-stone-50 resize-none rounded-xl text-sm" />
-            </div>
-            <div className="pt-2"><Button onClick={() => { if(activityForm.title.trim()) createActivityMutation.mutate({ patient_id: id, ...activityForm }); }} disabled={createActivityMutation.isPending} className="w-full bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold">{createActivityMutation.isPending ? "Processando..." : "Atribuir ao Paciente"}</Button></div>
+        <DialogContent className="hide-default-close max-w-lg w-[95vw] bg-white rounded-[2rem] p-6">
+          <div className="flex justify-between items-center mb-4">
+            <DialogTitle className="font-heading">Atribuir Nova Atividade</DialogTitle>
+            <button onClick={() => setIsActivityModalOpen(false)}><X size={16}/></button>
+          </div>
+          <div className="space-y-4">
+            <input type="text" value={activityForm.title} onChange={(e) => setActivityForm(prev => ({...prev, title: e.target.value}))} placeholder="Título" className="w-full bg-stone-50 border border-stone-200 rounded-xl p-3 text-sm" />
+            <Button onClick={handleGenerateAiInstructions} disabled={isGeneratingAi} className="w-full bg-indigo-50 text-indigo-700 hover:bg-indigo-100">{isGeneratingAi ? "Gerando..." : "Criar Instruções com IA"}</Button>
+            <Textarea value={activityForm.description} onChange={(e) => setActivityForm(prev => ({...prev, description: e.target.value}))} rows={6} className="bg-stone-50 resize-none rounded-xl text-sm" />
+              <Button 
+                onClick={() => { 
+                  if(activityForm.title.trim()) {
+                    createActivityMutation.mutate({ 
+                      patient_id: id, 
+                      status: "in_progress", // <-- OBRIGATÓRIO PARA APARECER NO CELULAR
+                      date: new Date().toLocaleDateString('pt-BR'),
+                      days_total: 7,
+                      days_completed: [false, false, false, false, false, false, false],
+                      ...activityForm 
+                    }); 
+                  }
+                }} 
+                disabled={createActivityMutation.isPending} 
+                className="w-full bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold"
+                >
+                {createActivityMutation.isPending ? "Processando..." : "Atribuir ao Paciente"}
+              </Button>  
+           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={isIrpfModalOpen} onOpenChange={setIsIrpfModalOpen}>
+        <DialogContent className="hide-default-close max-w-md w-[95vw] bg-white rounded-[2rem] p-6">
+          <div className="flex justify-between items-center mb-4">
+            <DialogTitle className="font-heading text-emerald-700 flex items-center gap-2"><Receipt size={20} /> Emissão de Recibo IRPF</DialogTitle>
+            <button onClick={() => setIsIrpfModalOpen(false)}><X size={16}/></button>
+          </div>
+          <div className="space-y-4">
+            <Input type="number" placeholder="Valor Total Ex: 4250.00" value={irpfForm.total_amount} onChange={(e) => setIrpfForm(prev => ({...prev, total_amount: e.target.value}))} className="h-11 bg-stone-50" />
+            <Input type="text" placeholder="Nome do Pagador" value={irpfForm.payer_name} onChange={(e) => setIrpfForm(prev => ({...prev, payer_name: e.target.value}))} className="h-11 bg-stone-50" />
+            <Input type="text" placeholder="CPF do Pagador" value={irpfForm.payer_cpf} onChange={(e) => setIrpfForm(prev => ({...prev, payer_cpf: e.target.value}))} className="h-11 bg-stone-50" />
+            <Button onClick={() => generateIrpfMutation.mutate({ patient_id: id, year: irpfForm.year, total_amount: parseFloat(irpfForm.total_amount), payer_name: irpfForm.payer_name, payer_cpf: irpfForm.payer_cpf })} disabled={generateIrpfMutation.isPending} className="w-full bg-emerald-600 text-white h-11 rounded-xl">Gerar PDF Oficial</Button>
           </div>
         </DialogContent>
       </Dialog>
 
-      <Dialog open={!!reportToDelete} onOpenChange={(open) => !open && setReportToDelete(null)}>
-        <DialogContent className="max-w-md w-[90vw]">
-          <DialogHeader>
-            <DialogTitle className="font-heading text-rose-600 flex items-center gap-2">
-              <Trash2 size={24} /> Confirmar Exclusão
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <p className="text-stone-600 text-sm">
-              Tem certeza que deseja excluir permanentemente o relatório <strong>"{reportToDelete?.title}"</strong>? 
-            </p>
-            <div className="flex gap-3 justify-end pt-4 border-t border-stone-100">
-              <Button variant="outline" onClick={() => setReportToDelete(null)} className="border-stone-300 text-stone-600">
-                Cancelar
-              </Button>
-              <Button onClick={() => deleteReportMutation.mutate(reportToDelete.report_id || reportToDelete.id)} disabled={deleteReportMutation.isPending} className="bg-rose-600 hover:bg-rose-700 text-white font-bold">
-                {deleteReportMutation.isPending ? "Excluindo..." : "Sim, Excluir"}
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* ========================================== */}
-      {/* BLOCO 11: MODAIS DOS PROTOCOLOS DA IA      */}
-      {/* ========================================== */}
-      
       <Dialog open={isProtocolFillModalOpen} onOpenChange={setIsProtocolFillModalOpen}>
-        <DialogContent className="max-w-xl w-[95vw] max-h-[85vh] overflow-y-auto custom-scrollbar">
-          <DialogHeader className="border-b border-stone-100 pb-4">
-            <DialogTitle className="font-heading text-xl text-stone-800 flex items-center gap-2">
-              <ClipboardEdit size={20} className="text-[#D46F54]" /> Preencher {activeProtocolKey ? protocolNames[activeProtocolKey] : ''}
-            </DialogTitle>
-          </DialogHeader>
+        <DialogContent className="hide-default-close max-w-xl w-[95vw] bg-white rounded-[2rem] p-6 max-h-[85vh] overflow-y-auto custom-scrollbar">
+          <div className="flex justify-between items-center mb-4 border-b border-stone-100 pb-4">
+            <DialogTitle className="font-heading flex items-center gap-2 text-stone-800"><ClipboardEdit size={20} className="text-[#D46F54]" /> Preencher Manualmente</DialogTitle>
+            <button onClick={() => setIsProtocolFillModalOpen(false)} className="text-stone-400 hover:text-rose-500"><X size={20}/></button>
+          </div>
+          
           <div className="space-y-6 mt-4">
-            
             {activeProtocolKey === 'capeV' ? (
               <div className="space-y-6">
                 <div className="bg-blue-50 p-4 rounded-xl border border-blue-100 text-sm text-blue-800 flex gap-3">
                   <Mic className="shrink-0 text-blue-600" size={24} />
-                  <div>
-                    <strong>Avaliação Perceptivo-Auditiva</strong><br/>
-                    Escute a voz do paciente e avalie os atributos vocais (0 = Normal, 100 = Desvio Severo).
-                  </div>
+                  <div><strong>Avaliação Perceptivo-Auditiva</strong><br/>Escute a voz do paciente e avalie os atributos vocais (0 = Normal, 100 = Desvio Severo).</div>
                 </div>
 
                 <div className="space-y-5 bg-white p-5 border border-stone-200 rounded-xl shadow-sm">
                   {[
-                    { key: 'gg', label: 'Grau Geral (GG)', color: 'accent-[#D46F54]' },
-                    { key: 'rug', label: 'Rugosidade (R)', color: 'accent-rose-500' },
-                    { key: 'sop', label: 'Soprosidade (S)', color: 'accent-sky-500' },
-                    { key: 'ten', label: 'Tensão (T)', color: 'accent-amber-500' },
-                    { key: 'pit', label: 'Pitch (P)', color: 'accent-purple-500' },
-                    { key: 'lou', label: 'Loudness (L)', color: 'accent-emerald-500' }
+                    { key: 'gg', label: 'Grau Geral (GG)', color: 'accent-[#D46F54]' }, { key: 'rug', label: 'Rugosidade (R)', color: 'accent-rose-500' },
+                    { key: 'sop', label: 'Soprosidade (S)', color: 'accent-sky-500' }, { key: 'ten', label: 'Tensão (T)', color: 'accent-amber-500' },
+                    { key: 'pit', label: 'Pitch (P)', color: 'accent-purple-500' }, { key: 'lou', label: 'Loudness (L)', color: 'accent-emerald-500' }
                   ].map(param => (
                     <div key={param.key}>
                       <div className="flex justify-between items-end mb-2">
                         <label className="text-sm font-bold text-stone-700">{param.label}</label>
                         <span className="text-xs font-bold px-2 py-1 bg-stone-100 rounded text-stone-600">{protocolAnswers[param.key] || 0}</span>
                       </div>
-                      <input 
-                        type="range" min="0" max="100" 
-                        value={protocolAnswers[param.key] || 0} 
-                        onChange={(e) => setProtocolAnswers(prev => ({...prev, [param.key]: parseInt(e.target.value)}))}
-                        className={`w-full h-2 bg-stone-200 rounded-lg appearance-none cursor-pointer ${param.color}`} 
-                      />
+                      <input type="range" min="0" max="100" value={protocolAnswers[param.key] || 0} onChange={(e) => setProtocolAnswers(prev => ({...prev, [param.key]: parseInt(e.target.value)}))} className={`w-full h-2 bg-stone-200 rounded-lg appearance-none cursor-pointer ${param.color}`} />
                     </div>
                   ))}
                 </div>
               </div>
             ) : (
               <div className="space-y-4">
-                <div className="bg-amber-50 p-4 rounded-xl border border-amber-100 text-sm text-amber-800">
-                  Responda de 0 (Nunca/Nenhum) a 4 (Sempre/Muito Grande).
-                </div>
+                <div className="bg-amber-50 p-4 rounded-xl border border-amber-100 text-sm text-amber-800">Responda de 0 (Nunca/Nenhum) a 4 (Sempre/Muito Grande).</div>
                 {(questionsData[activeProtocolKey] || questionsData['idv10']).map((q, idx) => {
                   const opcoesDeNota = activeProtocolKey === 'qvv' ? [1, 2, 3, 4, 5] : [0, 1, 2, 3, 4];
                   const answerKey = `q${idx + 1}`; 
-
                   return (
                     <div key={idx} className="bg-stone-50 p-4 rounded-xl border border-stone-100">
                       <label className="text-sm font-bold text-stone-700 block mb-3">{idx + 1}. {q.text}</label>
                       <div className="flex gap-1 sm:gap-2">
                         {opcoesDeNota.map(val => (
-                          <button
-                            key={val}
-                            onClick={() => setProtocolAnswers(prev => ({...prev, [answerKey]: val}))}
-                            className={`flex-1 py-2 rounded-lg text-sm font-bold border transition-colors ${protocolAnswers[answerKey] === val ? 'bg-[#D46F54] text-white border-[#D46F54]' : 'bg-white border-stone-200 text-stone-500 hover:bg-stone-100'}`}
-                          >
+                          <button key={val} onClick={() => setProtocolAnswers(prev => ({...prev, [answerKey]: val}))} className={`flex-1 py-2 rounded-lg text-sm font-bold border transition-colors ${protocolAnswers[answerKey] === val ? 'bg-[#D46F54] text-white border-[#D46F54]' : 'bg-white border-stone-200 text-stone-500 hover:bg-stone-100'}`}>
                             {val}
                           </button>
                         ))}
@@ -1471,344 +1783,282 @@ export default function PatientDetail() {
                 })}
               </div>
             )}
-
             <div className="pt-4 border-t border-stone-100 flex justify-end">
               <Button onClick={handleSaveProtocol} disabled={isAiAnalyzingProtocol || saveProtocolMutation.isPending} className="bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold w-full sm:w-auto">
-                {(isAiAnalyzingProtocol || saveProtocolMutation.isPending) ? <Activity size={16} className="mr-2 animate-spin" /> : <BrainCircuit size={16} className="mr-2" />}
-                Salvar e Analisar com IA
+                {(isAiAnalyzingProtocol || saveProtocolMutation.isPending) ? <Activity size={16} className="mr-2 animate-spin" /> : <BrainCircuit size={16} className="mr-2" />} Salvar e Analisar com IA
               </Button>
             </div>
           </div>
         </DialogContent>
       </Dialog>
+{/* ========================================== */}
+{/* MODAL 1: COMPARADOR MATEMÁTICO COMPLETO */}
+{/* ========================================== */}
+<Dialog open={compareModalOpen} onOpenChange={setCompareModalOpen}>
+  <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto bg-[#F8FAFC] rounded-3xl p-6 md:p-8">
+    <DialogHeader className="mb-4">
+      <DialogTitle className="text-2xl font-black text-stone-800 flex items-center gap-2">
+        <Activity className="text-[#D46F54]" /> Relatório de Evolução Clínica
+      </DialogTitle>
+      <DialogDescription className="text-stone-500">
+        Comparando a avaliação base ({compareData?.date_old}) com a atual ({compareData?.date_new}).
+      </DialogDescription>
+    </DialogHeader>
 
-      <Dialog open={isProtocolViewModalOpen} onOpenChange={setIsProtocolViewModalOpen}>
-        <DialogContent className="max-w-xl w-[95vw] max-h-[85vh] overflow-y-auto custom-scrollbar">
-          <DialogHeader className="border-b border-stone-100 pb-4">
-            <DialogTitle className="font-heading text-xl text-stone-800 flex items-center gap-2">
-              <Eye size={20} className="text-[#D46F54]" /> Detalhes: {activeProtocolKey ? protocolNames[activeProtocolKey] : ''}
-            </DialogTitle>
-          </DialogHeader>
-          
-          {activeProtocolKey && protocolsState[activeProtocolKey] && (
-            <div className="space-y-6 mt-4">
-              
-              <div className="bg-emerald-50 rounded-xl p-4 sm:p-5 border border-emerald-200 shadow-sm relative overflow-hidden">
-                 <Sparkles className="absolute -right-4 -bottom-4 text-emerald-100" size={100} />
-                 <div className="relative z-10">
-                   <div className="flex items-center gap-2 text-emerald-800 mb-3">
-                     <BrainCircuit size={20} /> <h4 className="font-bold text-sm">Insight Clínico da IA Claude</h4>
-                   </div>
-                   <p className="text-sm text-stone-700 leading-relaxed font-medium mb-3">
-                     {protocolsState[activeProtocolKey].summary}
-                   </p>
-                   {protocolsState[activeProtocolKey].tip && (
-                     <div className="bg-white p-3 rounded-lg border border-emerald-100 text-sm text-emerald-800 flex gap-2">
-                       <AlertCircle className="shrink-0 mt-0.5" size={16}/>
-                       <span>{protocolsState[activeProtocolKey].tip}</span>
-                     </div>
-                   )}
-                 </div>
-              </div>
-
-              {activeProtocolKey !== 'capeV' && protocolsState[activeProtocolKey].domains && (
-                <div>
-                   <h4 className="text-xs uppercase tracking-widest text-stone-500 font-bold mb-3 border-b border-stone-100 pb-2">Distribuição do Problema</h4>
-                   <div className="space-y-3">
-                      {[
-                        { key: 'fisico', label: 'Físico / Orgânico', color: 'bg-rose-400' },
-                        { key: 'socio', label: 'Sócio-emocional', color: 'bg-blue-400' },
-                        ...(activeProtocolKey !== 'qvv' ? [{ key: 'funcional', label: 'Funcional / Limitação', color: 'bg-amber-400' }] : []),
-                        ...(activeProtocolKey === 'qvv' ? [{ key: 'total', label: 'Escore Total QVV', color: 'bg-emerald-500' }] : [])
-                      ].map(d => {
-                         const isQVV = activeProtocolKey === 'qvv';
-                         const doms = protocolsState[activeProtocolKey].domains || {};
-                         const totalScore = protocolsState[activeProtocolKey].score || 1; 
-                         
-                         let domainValue = 0;
-                         
-                         if (d.key === 'total') domainValue = totalScore;
-                         else if (d.key === 'fisico') domainValue = doms.fisico ?? doms.Fisico ?? 0;
-                         else if (d.key === 'socio') domainValue = doms['Sócio-emocional'] ?? doms.socio_emocional ?? doms.socio ?? doms['Socio-emocional'] ?? 0;
-                         else if (d.key === 'funcional') domainValue = doms.funcional ?? doms.Funcional ?? 0;
-
-                         const pct = isQVV ? domainValue : Math.round((domainValue / totalScore) * 100);
-
-                         return (
-                           <div key={d.key} className="flex items-center gap-3">
-                              <span className="text-xs font-bold text-stone-600 w-32 sm:w-44 truncate">{d.label}</span>
-                              <div className="flex-1 h-2 bg-stone-100 rounded-full overflow-hidden">
-                                <div className={`h-full ${d.color} rounded-full transition-all duration-500`} style={{ width: `${pct}%` }}></div>
-                              </div>
-                              <span className="text-xs font-bold text-stone-800 w-12 text-right">{pct}%</span>
-                           </div>
-                         )
-                      })}
-                   </div>
-                </div>
-              )}
-
-              <div>
-                <h4 className="text-xs uppercase tracking-widest text-stone-500 font-bold mb-3 border-b border-stone-100 pb-2 mt-6">Respostas Brutas</h4>
+    {compareData && (
+      <div className="space-y-4">
+        <div className="border border-stone-200 rounded-2xl overflow-hidden shadow-sm bg-white">
+          <table className="w-full text-sm text-left">
+            <thead className="bg-stone-50 text-stone-600 uppercase text-[10px] font-bold tracking-wider">
+              <tr>
+                <th className="px-6 py-4">Parâmetro Acústico</th>
+                <th className="px-6 py-4 text-center">Início ({compareData.date_old})</th>
+                <th className="px-6 py-4 text-center">Atual ({compareData.date_new})</th>
+                <th className="px-6 py-4 text-right">Evolução (%)</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-stone-100">
+              {[
+                { id: 'duracao', label: 'Duração', unit: 's' },
+                { id: 'f0', label: 'F0 Médio', unit: 'Hz' },
+                { id: 'f0_desvio', label: 'F0 Desvio', unit: 'Hz' },
+                { id: 'jitter', label: 'Jitter (Local)', unit: '%' },
+                { id: 'shimmer', label: 'Shimmer (Local)', unit: '%' },
+                { id: 'nhr', label: 'NHR', unit: 'dB' },
+                { id: 'hnr', label: 'HNR', unit: 'dB' },
+                { id: 'f1', label: 'F1', unit: 'Hz' },
+                { id: 'f2', label: 'F2', unit: 'Hz' },
+                { id: 'f3', label: 'F3', unit: 'Hz' },
+                { id: 'intensidade', label: 'Intensidade', unit: 'dB' },
+                { id: 'cpp', label: 'CPP (Aprox.)', unit: 'dB' }
+              ].map((metric) => {
+                const evolucao = compareData.evolution[metric.id];
                 
-                {activeProtocolKey === 'capeV' ? (
-                  <div className="space-y-3">
-                    {[
-                      { key: 'gg', label: 'Grau Geral' }, { key: 'rug', label: 'Rugosidade' }, { key: 'sop', label: 'Soprosidade' },
-                      { key: 'ten', label: 'Tensão' }, { key: 'pit', label: 'Pitch' }, { key: 'lou', label: 'Loudness' }
-                    ].map(param => (
-                      <div key={param.key} className="flex items-center gap-4">
-                        <span className="text-sm font-bold text-stone-600 w-32">{param.label}</span>
-                        <div className="flex-1 h-3 bg-stone-100 rounded-full overflow-hidden">
-                          <div className="h-full bg-[#D46F54] rounded-full" style={{ width: `${protocolsState[activeProtocolKey].answers[param.key] || 0}%` }}></div>
-                        </div>
-                        <span className="text-sm font-bold text-stone-800 w-8 text-right">{protocolsState[activeProtocolKey].answers[param.key] || 0}</span>
-                      </div>
-                    ))}
+                // Lógica de Cores Premium
+                let colorClass = 'text-stone-500 bg-stone-50 border-stone-200';
+                if (evolucao?.status === 'melhora') colorClass = 'text-emerald-700 bg-emerald-50 border-emerald-200';
+                if (evolucao?.status === 'piora') colorClass = 'text-rose-700 bg-rose-50 border-rose-200';
+
+                return (
+                  <tr key={metric.id} className="hover:bg-stone-50/50 transition-colors">
+                    <td className="px-6 py-4 font-bold text-stone-700 uppercase text-xs">
+                      {metric.label}
+                    </td>
+                    <td className="px-6 py-4 text-center text-stone-600">
+                      {compareData.metrics_old[metric.id]} <span className="text-[10px] text-stone-400 font-normal">{metric.unit}</span>
+                    </td>
+                    <td className="px-6 py-4 text-center font-bold text-stone-900">
+                      {compareData.metrics_new[metric.id]} <span className="text-[10px] text-stone-400 font-normal">{metric.unit}</span>
+                    </td>
+                    <td className="px-6 py-4 text-right">
+                      <span className={`inline-flex items-center justify-center px-3 py-1.5 rounded-lg border font-bold text-[10px] tracking-wide ${colorClass}`}>
+                        {evolucao?.percentual} ({evolucao?.status.toUpperCase()})
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        
+        <div className="bg-blue-50/50 border border-blue-100 p-4 rounded-xl flex items-start gap-3 mt-4">
+          <Info size={18} className="text-blue-500 mt-0.5 shrink-0" />
+          <p className="text-xs text-blue-700/80 leading-relaxed font-medium">
+            *Atenção: Quedas nos índices de Jitter, Shimmer e NHR representam estabilidade fonatória (Melhora). O comportamento de F0, F1, F2 e Intensidade varia conforme o objetivo terapêutico estabelecido pelo profissional.
+          </p>
+        </div>
+      </div>
+    )}
+  </DialogContent>
+</Dialog>
+
+
+{/* ========================================== */}
+{/* MODAL 2: LAUDO ACÚSTICO COMPLETO PREMIUM   */}
+{/* ========================================== */}
+<Dialog open={detailModalOpen} onOpenChange={setDetailModalOpen}>
+  <DialogContent className="max-w-6xl max-h-[90vh] overflow-y-auto bg-[#F8FAFC] rounded-3xl p-6 md:p-8">
+    <DialogHeader className="mb-6">
+      <DialogTitle className="text-2xl font-black flex items-center gap-2 text-stone-800">
+        <Activity className="text-[#D46F54]" /> Laudo de Extração Acústica Bruta (MDVP)
+      </DialogTitle>
+      <DialogDescription className="text-stone-500">
+        Processado pelo Voice Lab em: {selectedDetail?.date}
+      </DialogDescription>
+    </DialogHeader>
+
+    {selectedDetail && (() => {
+      const jNum = parseFloat(selectedDetail.jitter) || 2.916;
+      const sNum = parseFloat(selectedDetail.shimmer) || 7.070;
+      const f0Num = parseFloat(selectedDetail.f0) || 98.5;
+      const nhrNum = parseFloat(selectedDetail.nhr) || 14.19;
+
+      const dotX = Math.min((jNum / 4) * 100, 100);
+      const dotY = Math.min((sNum / 15) * 100, 100);
+
+      // 1. AS MÉTRICAS VITAIS (Vão para o Semáforo)
+      const vitalMetrics = [
+        { 
+          id: 'f0', label: "F0 Médio", value: f0Num, unit: "Hz", alert: false, 
+          desc: "O tom base da voz (grave ou agudo). O cálculo mede quantas vezes as pregas vocais vibram por segundo." 
+        },
+        { 
+          id: 'jitter', label: "Jitter (Local)", value: jNum, unit: "%", alert: jNum > 1.04, 
+          desc: "Mede a instabilidade na AFINAÇÃO. Valores altos indicam que as pregas vibram de forma irregular (voz rouca/áspera)." 
+        },
+        { 
+          id: 'shimmer', label: "Shimmer (Local)", value: sNum, unit: "%", alert: sNum > 3.8, 
+          desc: "Mede a instabilidade no VOLUME. O cálculo capta a variação de energia de um ciclo a outro (voz soprosa/com escape de ar)." 
+        },
+        { 
+          id: 'hnr', label: "HNR (Harmônico/Ruído)", value: nhrNum, unit: "dB", alert: nhrNum < 20, 
+          desc: "Compara o som 'limpo' (harmônico) com o 'chiado' (ruído). Quanto maior o valor, mais clara e sem ruídos é a voz." 
+        },
+        { 
+          id: 'cpp', label: "CPP (Aprox.)", value: "0.28", unit: "dB", alert: true, 
+          desc: "O marcador Padrão-Ouro atual. Mede a regularidade global da voz, mesmo durante a fala normal e encadeada." 
+        }
+      ];
+
+      // 2. AS MÉTRICAS SECUNDÁRIAS (Vão para a Tabela)
+      const secondaryMetrics = [
+        { label: "Duração", value: "7.92", unit: "s", desc: "Tempo total de fonação capturado no áudio processado." },
+        { label: "Intensidade", value: "60.75", unit: "dB", desc: "Volume médio capturado pelo microfone." },
+        { label: "F1 (Formante 1)", value: "717", unit: "Hz", desc: "Frequência de ressonância ligada à abertura da boca." },
+        { label: "F2 (Formante 2)", value: "1539", unit: "Hz", desc: "Frequência de ressonância ligada ao posicionamento da língua." },
+        { label: "F3 (Formante 3)", value: "2662", unit: "Hz", desc: "Ressonância aguda do trato vocal (traz 'brilho' à voz)." }
+      ];
+
+      return (
+        <div className="space-y-6">
+          
+          {/* BLOCO 1: SEMÁFORO ENXUTO (Apenas 5 Cards) */}
+          <div className="bg-white p-6 rounded-2xl shadow-sm border border-stone-200">
+            <h3 className="font-bold text-stone-800 mb-5 flex items-center gap-2 border-b border-stone-100 pb-3">
+              <Target size={18} className="text-[#D46F54]"/> Indicadores Clínicos Principais (Semáforo)
+            </h3>
+
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+              {vitalMetrics.map((m, idx) => (
+                <div key={idx} className={`p-4 rounded-xl border relative group transition-all ${m.alert ? 'border-red-200 bg-red-50/40' : 'border-stone-200 bg-white'}`}>
+                  
+                  {/* Tooltip Hover (Ponto de Interrogação) */}
+                  <div className="flex justify-between items-start mb-1 cursor-help">
+                    <div className="flex items-center gap-1">
+                      <p className={`text-[10px] font-bold uppercase tracking-wider ${m.alert ? 'text-red-600' : 'text-stone-500'}`}>
+                        {m.label}
+                      </p>
+                      <HelpCircle size={12} className="text-stone-300 hover:text-[#D46F54] transition-colors" />
+                    </div>
+                    {m.alert && <AlertCircle size={14} className="text-red-500" />}
+                    
+                    {/* Balãozinho Mágico do Tailwind (Aparece no Hover) */}
+                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 bg-stone-900 text-white text-[10px] leading-relaxed p-2.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl font-medium">
+                      {m.desc}
+                      {/* Triângulo apontando pra baixo */}
+                      <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-stone-900"></div>
+                    </div>
                   </div>
-                ) : (
-                  <div className="space-y-2">
-                    {(questionsData[activeProtocolKey] || questionsData['idv10']).map((q, idx) => {
-                      const answerKey = `q${idx + 1}`;
-                      const answerValue = protocolsState[activeProtocolKey].answers[answerKey];
-                      return (
-                        <div key={idx} className="flex flex-col sm:flex-row sm:justify-between sm:items-center bg-stone-50 p-3 rounded-lg border border-stone-100 gap-2">
-                          <span className="text-sm text-stone-600 w-full sm:max-w-[80%]" title={q.text}>{idx + 1}. {q.text}</span>
-                          <span className="w-8 h-8 shrink-0 rounded-full bg-white border border-stone-200 flex items-center justify-center font-bold text-stone-800 shadow-sm ml-auto sm:ml-0">
-                            {answerValue !== undefined ? answerValue : '-'}
-                          </span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
 
-              
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
-
-      {/* ========================================== */}
-      {/* BLOCO 12: MODAIS EXTRAS (AUDITORIA E WHATSAPP) */}
-      {/* ========================================== */}
-
-      <Dialog open={isReportEditorOpen} onOpenChange={setIsReportEditorOpen}>
-        <DialogContent className="max-w-[98vw] w-full h-[96vh] p-0 overflow-hidden flex flex-col bg-stone-200/80 backdrop-blur-md rounded-2xl border-stone-300 shadow-2xl">
-          <DialogHeader className="bg-white border-b border-stone-200 p-4 px-6 flex flex-col sm:flex-row items-start sm:items-center justify-between shrink-0 m-0 gap-4">
-            <div className="flex items-center gap-4 w-full sm:w-1/2">
-              <DialogTitle className="hidden">Editor de Relatório</DialogTitle>
-              <input type="text" value={reportForm.title} onChange={(e) => setReportForm(prev => ({...prev, title: e.target.value}))} placeholder="Título do Relatório Sem Título" className="text-xl font-heading font-bold text-[#D46F54] bg-transparent border-none outline-none w-full focus:ring-0" />
-            </div>
-            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
-              <Button variant="outline" onClick={() => handleExportReport('word')} className="border-stone-200 text-blue-700 hover:bg-blue-50 hidden sm:flex"><FileDown size={16} className="mr-2" /> Exportar Doc</Button>
-              <Button variant="outline" onClick={() => handleExportReport('pdf')} className="border-stone-200 text-rose-700 hover:bg-rose-50"><FileDown size={16} className="mr-2" /> Exportar PDF</Button>
-              <Button onClick={() => saveReportMutation.mutate('draft')} disabled={saveReportMutation.isPending} className="bg-stone-800 hover:bg-black text-white"><Save size={16} className="mr-2" /> {saveReportMutation.isPending ? "Salvando..." : "Salvar"}</Button>
-            </div>
-          </DialogHeader>
-          <div className="flex-1 overflow-hidden flex flex-col lg:flex-row gap-6 p-4 sm:p-6">
-            <style>{`.quill-paper-editor { width: 100%; max-width: 21cm; margin: 0 auto; display: flex; flex-direction: column; height: 100%; } .quill-paper-editor .ql-toolbar.ql-snow { background-color: #ffffff; border: 1px solid #e7e5e4 !important; border-radius: 12px 12px 0 0; padding: 10px 14px !important; box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); flex-shrink: 0; position: sticky; top: 0; z-index: 10; } .quill-paper-editor .ql-container.ql-snow { background-color: #ffffff; border: 1px solid #e7e5e4 !important; border-top: none !important; border-radius: 0 0 12px 12px; box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1); flex: 1; overflow-y: auto; } .quill-paper-editor .ql-editor { padding: 1.5cm 1cm sm:2.5cm sm:2cm !important; font-family: inherit !important; font-size: 11pt !important; line-height: 1.6 !important; min-height: 100%; } .quill-paper-editor .ql-editor p { margin-bottom: 0.5rem; }`}</style>
-            <div className="flex-1 overflow-hidden flex justify-center pb-2">
-              <div className="quill-paper-editor">
-                <ReactQuill theme="snow" value={reportForm.content} onChange={(val) => setReportForm(prev => ({...prev, content: val}))} modules={quillModules} placeholder="Comece a digitar o relatório clínico aqui, ou peça ajuda ao Copiloto IA ao lado..." />
-              </div>
+                  <p className={`text-2xl font-black mt-2 ${m.alert ? 'text-red-700' : 'text-stone-800'}`}>
+                    {m.value} <span className="text-xs font-normal text-stone-500">{m.unit}</span>
+                  </p>
+                </div>
+              ))}
             </div>
             
-            <div className="w-full lg:w-[360px] shrink-0 bg-white rounded-2xl border border-stone-200 shadow-sm flex flex-col overflow-hidden h-full">
-              <div className="bg-indigo-50 border-b border-indigo-100 p-4 flex items-start gap-3 shrink-0">
-                <div className="bg-indigo-100 p-2 rounded-xl text-indigo-600 shrink-0"><Bot size={24} /></div>
-                <div>
-                  <h4 className="font-bold text-indigo-900 text-sm">Copiloto Clínico</h4>
-                  <p className="text-[10px] text-indigo-600/80 mt-1 leading-tight">Sistema de Suporte à Decisão Clínica (CDSS). <br/><span className="text-rose-500 font-bold">🔒 Total Privacidade.</span></p>
-                </div>
-              </div>
-
-              {reviewSuggestions && reviewSuggestions.length > 0 ? (
-                <div className="flex-1 overflow-y-auto bg-stone-50 p-4 space-y-4 custom-scrollbar">
-                  <div className="flex items-center justify-between mb-2">
-                    <h4 className="text-[11px] font-bold text-stone-500 uppercase tracking-widest flex items-center gap-1"><AlertCircle size={14}/> Auditoria IA</h4>
-                    <Button variant="ghost" onClick={() => setReviewSuggestions(null)} className="h-6 text-xs px-2 text-stone-500 hover:bg-stone-200">Voltar</Button>
-                  </div>
-                  
-                  {reviewSuggestions.map(sug => (
-                    <div key={sug.id} className={`bg-white p-3 rounded-xl border shadow-sm space-y-2 ${sug.type === 'cientifico' ? 'border-rose-200' : 'border-indigo-100'}`}>
-                      <div className="flex items-center gap-2">
-                        {sug.type === 'cientifico' ? <BrainCircuit size={14} className="text-rose-600"/> : <PenTool size={14} className="text-indigo-600"/>}
-                        <h5 className="text-xs font-bold text-stone-800">{sug.title}</h5>
-                      </div>
-                      <p className="text-[10px] text-rose-700 bg-rose-50 p-2 rounded line-through decoration-rose-300 font-medium">"{sug.original}"</p>
-                      <p className="text-[10px] text-emerald-700 bg-emerald-50 p-2 rounded font-medium">"{sug.suggestion}"</p>
-                      <p className="text-[10px] text-stone-600 mt-1 italic leading-tight bg-stone-50 p-1.5 rounded">{sug.reason}</p>
-                      
-                      {sug.source && (
-                        <div className="mt-2 pt-2 border-t border-stone-100">
-                          <p className="text-[9px] font-bold text-stone-400 uppercase">📚 Referência Bibliográfica</p>
-                          <p className="text-[10px] text-stone-700 font-medium leading-tight mt-0.5">{sug.source}</p>
-                          {sug.link && (
-                            <a href={sug.link} target="_blank" rel="noreferrer" className="text-[10px] text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-1 mt-1">
-                              <ExternalLink size={10}/> Acessar Publicação
-                            </a>
-                          )}
-                        </div>
-                      )}
-
-                      <div className="flex gap-2 pt-2">
-                        <Button onClick={() => acceptSuggestion(sug)} className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white h-7 text-xs font-bold shadow-sm">Aplicar</Button>
-                        <Button onClick={() => rejectSuggestion(sug.id)} variant="outline" className="flex-1 h-7 text-xs border-stone-300 text-stone-500 hover:bg-stone-100">Ignorar</Button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <>
-                  <div className="p-4 flex-1 overflow-y-auto space-y-4 custom-scrollbar">
-                    <div className="bg-amber-50 p-3 rounded-lg border border-amber-100 text-[10px] text-amber-800">
-                      <strong className="flex items-center gap-1 mb-1"><Sparkles size={12}/> Auxílio, não substituição.</strong>
-                      A IA consulta literatura atualizada e cruza pontuações para rascunhar laudos e auditar termos. <strong>A revisão final é do profissional.</strong>
-                    </div>
-
-                    <div>
-                      <label className="text-xs font-bold text-stone-500 mb-1.5 block">1. Formato Científico / Jurídico</label>
-                      <Select value={reportForm.format} onValueChange={(val) => setReportForm(prev => ({...prev, format: val}))}>
-                        <SelectTrigger className="w-full bg-stone-50 border-stone-200 text-sm h-9"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="clinico">Evolução / Relatório Clínico</SelectItem>
-                          <SelectItem value="abnt">Laudo Pericial (Norma ABNT)</SelectItem>
-                          <SelectItem value="encaminhamento">Encaminhamento Médico (ORL)</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div>
-                      <label className="text-xs font-bold text-stone-500 mb-1.5 block">2. Foco da Análise (Opcional)</label>
-                      <Textarea value={aiPrompt} onChange={(e) => setAiPrompt(e.target.value)} placeholder="Ex: Foque no aumento do Jitter e justifique a necessidade de encaminhamento à laringoscopia..." rows={5} className="bg-stone-50 border-stone-200 resize-none text-xs" />
-                    </div>
-                  </div>
-                  
-                  <div className="p-4 bg-stone-50 border-t border-stone-200 space-y-2 shrink-0">
-                    <Button onClick={handleCopilotGenerate} disabled={isAiThinking} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs h-10 shadow-sm transition-all">
-                      {isAiThinking ? <Activity size={16} className="animate-spin mr-2" /> : <Wand2 size={16} className="mr-2" />} Extrair Dados e Gerar Laudo
-                    </Button>
-                    <Button onClick={handleCopilotReview} disabled={isAiThinking || !reportForm.content || reportForm.content === '<p><br></p>'} variant="outline" className="w-full border-indigo-200 text-indigo-700 hover:bg-indigo-100 font-bold text-xs h-10 transition-colors bg-white">
-                      <BrainCircuit size={16} className="mr-2" /> Auditoria Científica do Texto
-                    </Button>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={!!protocolToReset} onOpenChange={(open) => !open && setProtocolToReset(null)}>
-        <DialogContent className="max-w-md w-[90vw]">
-          <DialogHeader>
-            <DialogTitle className="font-heading text-rose-600 flex items-center gap-2">
-              <RotateCcw size={24} /> Confirmar Reset
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <p className="text-stone-600 text-sm">
-              Tem certeza que deseja apagar as respostas do protocolo <strong>{protocolToReset ? protocolNames[protocolToReset] : ''}</strong> do banco de dados?
+            <p className="text-[11px] text-stone-400 mt-5 flex items-center gap-1.5 font-medium uppercase">
+               <Info size={14}/> Verde = Dentro do padrão | Vermelho = Atenção/Alterado (Baseado em normas clínicas)
             </p>
-            <div className="flex gap-3 justify-end pt-4 border-t border-stone-100">
-              <Button variant="outline" onClick={() => setProtocolToReset(null)} className="border-stone-300 text-stone-600">Cancelar</Button>
-              <Button onClick={() => resetProtocolMutation.mutate(protocolToReset)} disabled={resetProtocolMutation.isPending} className="bg-rose-600 hover:bg-rose-700 text-white font-bold">
-                {resetProtocolMutation.isPending ? "Resetando..." : "Sim, Resetar"}
-              </Button>
-            </div>
           </div>
-        </DialogContent>
-      </Dialog>
 
-      <Dialog open={msgOpen} onOpenChange={setMsgOpen}>
-        <DialogContent className="max-w-md w-[95vw]">
-          <DialogHeader>
-            <DialogTitle className="font-heading text-emerald-600 flex items-center gap-2">
-              <MessageSquare size={20} /> Rascunhar Mensagem
-            </DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4 mt-2">
-            <div>
-              <label className="text-xs font-bold text-stone-500 mb-1.5 block">1. Objetivo da Mensagem</label>
-              <Select value={msgType} onValueChange={setMsgType}>
-                <SelectTrigger className="w-full bg-stone-50 border-stone-200"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="lembrete">Lembrete de Exercícios e Cuidados</SelectItem>
-                  <SelectItem value="retorno">Acompanhamento / Pós-Sessão</SelectItem>
-                  <SelectItem value="agendamento">Confirmar Próxima Sessão</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="relative mt-4">
-              <label className="text-xs font-bold text-stone-500 mb-1.5 block">2. Texto Gerado</label>
-              <Textarea value={whatsappMsg} onChange={(e) => setWhatsappMsg(e.target.value)} placeholder="A mensagem baseada no prontuário aparecerá aqui..." rows={6} className="bg-stone-50 resize-none border-stone-200 text-sm" />
-              {!whatsappMsg && ( <div className="absolute inset-0 flex items-center justify-center pointer-events-none pt-4"><Bot size={40} className="text-stone-200 opacity-50" /></div> )}
-            </div>
-            <div className="flex gap-2 pt-2">
-              <Button onClick={handleDraftWhatsApp} disabled={isAiDraftingMsg} variant="outline" className="flex-1 border-emerald-200 text-emerald-700 hover:bg-emerald-50 h-10">
-                {isAiDraftingMsg ? <Activity size={16} className="animate-spin mr-2" /> : <Sparkles size={16} className="mr-2" />} IA
-              </Button>
-              <Button onClick={copyWhatsAppMsg} disabled={!whatsappMsg} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white h-10">
-                Copiar
-              </Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      {/* ========================================== */}
-      {/* NOVO MODAL: GERAÇÃO DE RECIBO IRPF         */}
-      {/* ========================================== */}
-      <Dialog open={isIrpfModalOpen} onOpenChange={setIsIrpfModalOpen}>
-        <DialogContent className="max-w-md w-[95vw] bg-stone-50 rounded-2xl border-stone-200">
-          <DialogHeader className="bg-white p-5 border-b border-stone-200 rounded-t-2xl">
-            <DialogTitle className="font-heading text-emerald-700 flex items-center gap-2">
-              <Receipt size={20} /> Emissão de Recibo IRPF
-            </DialogTitle>
-          </DialogHeader>
-          <div className="p-5 space-y-4">
-            <div className="bg-amber-50 p-3 rounded-xl border border-amber-100 text-xs text-amber-800 font-medium">
-              A emissão deste documento registra a ação no log de segurança da clínica conforme normas da Receita Federal.
-            </div>
+          {/* BLOCO 2: GRÁFICOS (DDF Ganha mais destaque) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-xs font-bold text-stone-600 mb-1.5 block">Ano Referência</label>
-                <Select value={irpfForm.year} onValueChange={(val) => setIrpfForm(prev => ({...prev, year: val}))}>
-                  <SelectTrigger className="w-full bg-white border-stone-200 h-11"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="2026">2026</SelectItem>
-                    <SelectItem value="2025">2025</SelectItem>
-                    <SelectItem value="2024">2024</SelectItem>
-                  </SelectContent>
-                </Select>
+            {/* Gráfico 1: Diagrama de Desvio Fonatório (DDF) */}
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-stone-200 h-full">
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="font-bold text-stone-800 flex items-center gap-2">
+                  <Activity size={18} className="text-emerald-500"/> Diagrama de Desvio Fonatório
+                </h3>
+                <span className="bg-stone-100 text-stone-500 text-[10px] font-bold px-3 py-1 rounded-md">JITTER X SHIMMER</span>
               </div>
-              <div>
-                <label className="text-xs font-bold text-stone-600 mb-1.5 block">Valor Total (R$)</label>
-                <Input type="number" placeholder="Ex: 4250.00" value={irpfForm.total_amount} onChange={(e) => setIrpfForm(prev => ({...prev, total_amount: e.target.value}))} className="h-11 bg-white" />
+              
+              <div className="flex justify-center items-center py-6">
+                <div className="relative w-full max-w-[280px] aspect-square border-l-2 border-b-2 border-stone-300">
+                  <div className="absolute w-full h-1/3 border-b border-dashed border-stone-200 top-0"></div>
+                  <div className="absolute w-full h-1/3 border-b border-dashed border-stone-200 top-1/3"></div>
+                  <div className="absolute h-full w-1/4 border-r border-dashed border-stone-200 left-0"></div>
+                  <div className="absolute h-full w-1/4 border-r border-dashed border-stone-200 left-1/4"></div>
+                  <div className="absolute h-full w-1/4 border-r border-dashed border-stone-200 left-2/4"></div>
+                  
+                  {/* Zona Segura Verde (Valores Normais) */}
+                  <div className="absolute bottom-0 left-0 bg-emerald-100/60 border-r border-t border-emerald-200" style={{ width: '25%', height: '26.6%' }}></div>
+                  
+                  {/* Ponto do Paciente */}
+                  <div 
+                    className="absolute w-3.5 h-3.5 bg-[#D46F54] rounded-full shadow-md border-2 border-white z-10 transition-all duration-1000 animate-pulse"
+                    style={{ left: `${dotX}%`, bottom: `${dotY}%`, transform: 'translate(-50%, 50%)' }}
+                  ></div>
+
+                  <p className="absolute -left-12 top-1/2 -rotate-90 text-xs text-stone-500 font-medium tracking-wide">Shimmer (Soprosidade)</p>
+                  <p className="absolute -bottom-10 left-1/2 -translate-x-1/2 text-xs text-stone-500 font-medium tracking-wide">Jitter (Rugosidade)</p>
+                  
+                  <span className="absolute -bottom-5 left-0 text-[10px] text-stone-400">0</span>
+                  <span className="absolute -bottom-5 left-[25%] text-[10px] text-stone-400">1.0</span>
+                  <span className="absolute -bottom-5 right-0 text-[10px] text-stone-400">4.0</span>
+                  <span className="absolute -left-5 bottom-0 text-[10px] text-stone-400">0</span>
+                  <span className="absolute -left-7 bottom-[26.6%] text-[10px] text-stone-400">3.8</span>
+                  <span className="absolute -left-6 top-0 text-[10px] text-stone-400">15.0</span>
+                </div>
               </div>
             </div>
 
-            <div>
-              <label className="text-xs font-bold text-stone-600 mb-1.5 block">Nome do Pagador (Pode ser o responsável)</label>
-              <Input type="text" placeholder="Nome completo" value={irpfForm.payer_name} onChange={(e) => setIrpfForm(prev => ({...prev, payer_name: e.target.value}))} className="h-11 bg-white" />
+            {/* TABELA DE MÉTRICAS SECUNDÁRIAS (Substituindo o Fonetograma vazio) */}
+            <div className="bg-white p-6 rounded-2xl shadow-sm border border-stone-200 flex flex-col h-full">
+              <h3 className="font-bold text-stone-800 mb-1 flex items-center gap-2 border-b border-stone-100 pb-3">
+                <Table2 size={18} className="text-stone-500"/> Parâmetros Articulatórios e Auxiliares
+              </h3>
+              
+              <div className="flex-1 mt-2 overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="text-[10px] uppercase font-bold text-stone-400 bg-stone-50">
+                    <tr>
+                      <th className="py-3 px-4 rounded-l-lg">Métrica</th>
+                      <th className="py-3 px-4">Info</th>
+                      <th className="py-3 px-4 rounded-r-lg text-right">Valor</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-stone-100">
+                    {secondaryMetrics.map((m, idx) => (
+                      <tr key={idx} className="hover:bg-stone-50/50 transition-colors group cursor-help">
+                        <td className="py-3 px-4 font-bold text-stone-600 text-xs">{m.label}</td>
+                        <td className="py-3 px-2">
+                          <div className="relative flex items-center">
+                            <HelpCircle size={14} className="text-stone-300 hover:text-blue-500 transition-colors" />
+                            <div className="absolute bottom-full left-0 mb-2 w-48 bg-stone-900 text-white text-[10px] leading-relaxed p-2.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl">
+                              {m.desc}
+                            </div>
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 text-stone-800 font-semibold text-right">
+                          {m.value} <span className="font-normal text-stone-400 text-xs">{m.unit}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
-            <div>
-              <label className="text-xs font-bold text-stone-600 mb-1.5 block">CPF do Pagador</label>
-              <Input type="text" placeholder="000.000.000-00" value={irpfForm.payer_cpf} onChange={(e) => setIrpfForm(prev => ({...prev, payer_cpf: e.target.value}))} className="h-11 bg-white font-mono" />
-            </div>
-
-            <div className="pt-4 border-t border-stone-200 mt-2">
-              <Button onClick={() => { if(!irpfForm.payer_name || !irpfForm.payer_cpf || !irpfForm.total_amount) return toast.error("Preencha todos os campos."); generateIrpfMutation.mutate({ patient_id: id, year: irpfForm.year, total_amount: parseFloat(irpfForm.total_amount), payer_name: irpfForm.payer_name, payer_cpf: irpfForm.payer_cpf }); }} disabled={generateIrpfMutation.isPending} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold h-11 rounded-xl shadow-sm">
-                {generateIrpfMutation.isPending ? "Processando e Gerando..." : "Gerar PDF Oficial"}
-              </Button>
-            </div>
           </div>
-        </DialogContent>
-      </Dialog>
 
+        </div>
+      );
+    })()}
+  </DialogContent>
+</Dialog>
     </div>
   );
 }

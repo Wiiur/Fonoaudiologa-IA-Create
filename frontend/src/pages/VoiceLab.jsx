@@ -15,14 +15,14 @@ import MarkdownView from "@/components/MarkdownView";
 import { 
   ArrowLeft, Activity, Target, SlidersHorizontal, Settings2, Download, 
   BrainCircuit, AudioLines, Plus, AlertCircle, CheckCircle2, Mic, Square,
-  Trash2, UploadCloud, FileClock, Calendar, Bot, Gauge, BookOpen
+  Trash2, UploadCloud, FileClock, Calendar, Bot, Gauge, BookOpen, HelpCircle, Info
 } from 'lucide-react';
 
 // Gráficos (Recharts)
 import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ReferenceArea } from 'recharts';
 
 // ============================================================================
-// 1. CONSTANTES E REGRAS DE NORMATIZAÇÃO
+// 1. CONSTANTES E REGRAS DE NORMATIZAÇÃO (COM DESCRIÇÕES PARA OS TOOLTIPS)
 // ============================================================================
 const RANGES = {
   jitter_local_pct: { max: 1.04, label: "Jitter" },
@@ -41,19 +41,21 @@ function classify(key, value) {
 }
 
 const METRIC_LABELS = [
-  { key: "duration_sec", label: "Duração", unit: "s", precision: 2 },
-  { key: "phonation_time_sec", label: "Fonação", unit: "s", precision: 2 },
-  { key: "f0_mean_hz", label: "F0 médio", unit: "Hz", precision: 1 },
-  { key: "f0_std_hz", label: "F0 desvio", unit: "Hz", precision: 2 },
-  { key: "jitter_local_pct", label: "Jitter (local)", unit: "%", precision: 3 },
-  { key: "shimmer_local_pct", label: "Shimmer (local)", unit: "%", precision: 3 },
-  { key: "hnr_db", label: "HNR", unit: "dB", precision: 2 },
-  { key: "f1_hz", label: "F1", unit: "Hz", precision: 0 },
-  { key: "f2_hz", label: "F2", unit: "Hz", precision: 0 },
-  { key: "f3_hz", label: "F3", unit: "Hz", precision: 0 },
-  { key: "intensity_db", label: "Intensidade", unit: "dB", precision: 2 },
-  { key: "cpp_db", label: "CPP (aprox.)", unit: "dB", precision: 2 },
+  { key: "duration_sec", label: "Duração", unit: "s", precision: 2, desc: "Tempo total de fonação extraído do áudio processado." },
+  { key: "phonation_time_sec", label: "Fonação", unit: "s", precision: 2, desc: "Tempo real de fonação sonora (descontando silêncios)." },
+  { key: "f0_mean_hz", label: "F0 médio", unit: "Hz", precision: 1, desc: "O tom base da voz (grave ou agudo). Mede as vibrações das pregas vocais por segundo." },
+  { key: "f0_std_hz", label: "F0 desvio", unit: "Hz", precision: 2, desc: "Grau de variação do tom base durante a fonação." },
+  { key: "jitter_local_pct", label: "Jitter (local)", unit: "%", precision: 3, desc: "Mede a instabilidade na AFINAÇÃO. Valores altos indicam vibração irregular (voz rouca)." },
+  { key: "shimmer_local_pct", label: "Shimmer (local)", unit: "%", precision: 3, desc: "Mede a instabilidade no VOLUME. Capta a variação de energia (voz soprosa)." },
+  { key: "hnr_db", label: "HNR", unit: "dB", precision: 2, desc: "Relação Harmônico/Ruído. Quanto maior o valor, mais clara e sem ruídos é a voz." },
+  { key: "f1_hz", label: "F1", unit: "Hz", precision: 0, desc: "Frequência de ressonância ligada à abertura da boca." },
+  { key: "f2_hz", label: "F2", unit: "Hz", precision: 0, desc: "Frequência de ressonância ligada ao posicionamento da língua." },
+  { key: "f3_hz", label: "F3", unit: "Hz", precision: 0, desc: "Ressonância aguda do trato vocal (traz 'brilho' à voz)." },
+  { key: "intensity_db", label: "Intensidade", unit: "dB", precision: 2, desc: "Volume médio capturado pelo microfone." },
+  { key: "cpp_db", label: "CPP (aprox.)", unit: "dB", precision: 2, desc: "Marcador Padrão-Ouro. Mede a regularidade global da voz para detectar disfonia." },
 ];
+
+const VITAL_KEYS = ["f0_mean_hz", "jitter_local_pct", "shimmer_local_pct", "hnr_db", "cpp_db"];
 
 // ============================================================================
 // 2. COMPONENTE GRAVADOR NATIVO
@@ -137,7 +139,6 @@ export default function VoiceLab() {
   const qc = useQueryClient();
   const [params] = useSearchParams();
   
-  // Estados de Negócio
   const [selectedPatient, setSelectedPatient] = useState(params.get("patient_id") || "");
   const [task, setTask] = useState("sustained_vowel");
   const [notes, setNotes] = useState("");
@@ -148,11 +149,9 @@ export default function VoiceLab() {
   const [reportText, setReportText] = useState("");
   const [streaming, setStreaming] = useState(false);
 
-  // Estados Visuais
-  const [viewMode, setViewMode] = useState("clinical"); // 'clinical' | 'scientific'
+  const [viewMode, setViewMode] = useState("clinical"); 
   const [spectroConfig, setSpectroConfig] = useState({ band: "estreita", showF0: true, showFormants: false });
 
-  // Queries
   const { data: patients = [] } = useQuery({ queryKey: ["patients"], queryFn: async () => (await api.get("/patients")).data });
   const { data: analyses = [] } = useQuery({ queryKey: ["voice-analyses", selectedPatient], queryFn: async () => (await api.get(`/voice/analyses${selectedPatient ? `?patient_id=${selectedPatient}` : ""}`)).data });
 
@@ -185,15 +184,10 @@ export default function VoiceLab() {
     
     try {
       const url = `${api.defaults.baseURL}/voice/analyses/${current.analysis_id}/report`;
-
-      // O FETCH BLINDADO COM O SEU CRACHÁ DE DESENVOLVEDOR!
       const res = await fetch(url, { 
         method: "POST", 
         credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          "user-id": "doc_mock_123" // <--- O SEGREDO ESTAVA AQUI O TEMPO TODO!
-        }
+        headers: { "Content-Type": "application/json", "user-id": "doc_mock_123" }
       });
       
       if (!res.ok) {
@@ -223,12 +217,7 @@ export default function VoiceLab() {
           } catch {}
         }
       }
-    } catch (e) { 
-      console.error("Erro detalhado do Copiloto:", e);
-      toast.error(`Falha: ${e.message}`); 
-    } finally { 
-      setStreaming(false); 
-    }
+    } catch (e) { toast.error(`Falha: ${e.message}`); } finally { setStreaming(false); }
   };
 
   const loadAnalysis = async (analysisId) => {
@@ -248,7 +237,6 @@ export default function VoiceLab() {
   return (
     <div className="p-4 sm:p-8 max-w-7xl mx-auto space-y-6 animate-in fade-in bg-stone-50 min-h-screen">
       
-      {/* CABEÇALHO GLOBAL */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4">
         <div>
           <Link to={`/patient/${selectedPatient || ''}`} className="flex items-center gap-2 text-stone-500 hover:text-[#B75C46] font-semibold transition-colors w-fit mb-2">
@@ -258,19 +246,17 @@ export default function VoiceLab() {
             <AudioLines className="text-[#D46F54]" size={28} /> Análise Vocal Instrumental
           </h1>
           <p className="text-sm text-stone-500 mt-1 max-w-xl">
-            Grave ou envie um áudio de fonação sustentada (ex.: vogal /a/ por 3–5s) para extrair métricas acústicas (Praat/Parselmouth) e gerar análise diagnóstica com IA.
+            Grave ou envie um áudio de fonação sustentada para extrair métricas acústicas e gerar análise diagnóstica com IA.
           </p>
         </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* ================================================= */}
-        {/* COLUNA ESQUERDA: CONTROLES E HISTÓRICO            */}
-        {/* ================================================= */}
+        {/* COLUNA ESQUERDA: CONTROLES */}
         <div className="lg:col-span-4 space-y-6">
           <div className="bg-white border border-stone-200 shadow-sm rounded-2xl p-6">
-            <div className="text-xs uppercase tracking-widest text-stone-500 font-bold mb-4 flex items-center gap-2">Nova Análise</div>
+            <div className="text-xs uppercase tracking-widest text-stone-500 font-bold mb-4">Nova Análise</div>
 
             <label className="text-xs font-medium text-stone-600 block mb-1">Paciente</label>
             <Select value={selectedPatient} onValueChange={setSelectedPatient}>
@@ -326,18 +312,22 @@ export default function VoiceLab() {
           </div>
         </div>
 
-        {/* ================================================= */}
-        {/* COLUNA DIREITA: DASHBOARD                         */}
-        {/* ================================================= */}
+        {/* COLUNA DIREITA: DASHBOARD */}
         <div className="lg:col-span-8 space-y-6">
           {!current ? (
-            <div className="bg-white border border-dashed border-stone-300 rounded-2xl h-full min-h-[400px] flex flex-col items-center justify-center text-center p-8">
-              <div className="text-sm text-stone-500">Selecione uma análise ou envie um novo áudio.</div>
+            /* 👇 AVISO DE PREMIUM ATIVADO PARA VOCÊ VER A MUDANÇA! */
+            <div className="bg-white border-2 border-dashed border-emerald-300 rounded-3xl h-full min-h-[400px] flex flex-col items-center justify-center text-center p-8 shadow-sm">
+              <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center mb-4">
+                <Target size={32} className="text-emerald-500" />
+              </div>
+              <h3 className="text-xl font-black text-stone-800 mb-2">Voice Lab Premium Ativado!</h3>
+              <p className="text-sm text-stone-500 max-w-md">
+                O código foi atualizado com sucesso. <b>Clique em uma gravação no histórico ao lado</b> ou faça um novo upload para ver os novos gráficos e o Espectrograma 4D.
+              </p>
             </div>
           ) : (
             <div className="animate-in slide-in-from-bottom-4 space-y-6">
               
-              {/* HEADER DO ÁUDIO */}
               <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
                 <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                   <div>
@@ -353,79 +343,91 @@ export default function VoiceLab() {
                 </div>
               </div>
 
-              {/* SUB-ABAS DE VISUALIZAÇÃO */}
               <div className="flex border-b border-stone-200">
                 <button onClick={() => setViewMode("clinical")} className={`px-6 py-3 font-bold text-sm transition-all border-b-2 flex items-center gap-2 ${viewMode === 'clinical' ? 'border-[#D46F54] text-[#D46F54] bg-[#F3E7E4]/20' : 'border-transparent text-stone-500 hover:text-stone-700 hover:bg-stone-50'}`}>
-                  <Target size={16} /> Visão Clínica (O "Resumo Mastigado")
+                  <Target size={16} /> Visão Clínica
                 </button>
                 <button onClick={() => setViewMode("scientific")} className={`px-6 py-3 font-bold text-sm transition-all border-b-2 flex items-center gap-2 ${viewMode === 'scientific' ? 'border-stone-800 text-stone-800 bg-stone-100' : 'border-transparent text-stone-500 hover:text-stone-700 hover:bg-stone-50'}`}>
-                  <SlidersHorizontal size={16} /> Visão Científica (A "Informação Pura")
+                  <SlidersHorizontal size={16} /> Visão Científica
                 </button>
               </div>
 
-              {/* MODO 1: VISÃO CLÍNICA */}
+              {/* MODO CLÍNICO */}
               {viewMode === "clinical" && (
                 <div className="space-y-6 animate-in fade-in">
                   
-                  {/* NOTA CPPS EM DESTAQUE (MOCK/SIMULAÇÃO BASEADO NO VALOR REAL SE EXISTIR) */}
-                  <div className="bg-gradient-to-br from-[#B75C46] to-[#D46F54] rounded-2xl p-6 shadow-md text-white flex items-center justify-between">
-                    <div>
-                      <p className="text-xs font-bold uppercase tracking-widest text-white/80 mb-1 flex items-center gap-1"><Gauge size={14}/> Qualidade Global da Voz (Baseado em CPPS)</p>
+                  <div className="bg-[#D46F54] rounded-3xl p-6 md:p-8 text-white shadow-lg relative overflow-hidden flex flex-col md:flex-row justify-between items-center gap-6">
+                    <div className="absolute -right-20 -top-20 w-64 h-64 bg-white/10 rounded-full blur-3xl"></div>
+                    <div className="relative z-10">
+                      <h2 className="text-sm font-bold uppercase tracking-widest text-white/80 mb-2 flex items-center gap-2">
+                        <Gauge size={16} /> Qualidade Global da Voz (Baseado em CPPS)
+                      </h2>
                       <div className="flex items-baseline gap-2">
-                        {/* Se o CPP estiver crítico (ex: 0.31), o score cai. Isso é um cálculo ilustrativo para gamificação */}
-                        <h3 className="text-4xl font-heading font-black">{current.metrics?.cpp_db > 10 ? '85' : '42'}</h3>
-                        <span className="text-lg font-medium text-white/70">/ 100</span>
+                        <span className="text-6xl font-black tracking-tighter">{current.metrics?.cpp_db > 10 ? '85' : '42'}</span>
+                        <span className="text-xl font-bold text-white/70">/ 100</span>
                       </div>
-                      <p className="text-xs mt-2 bg-white/20 px-2 py-1 rounded w-fit">
+                      <div className="mt-4 bg-white/20 backdrop-blur-sm w-max px-4 py-1.5 rounded-lg border border-white/30 text-sm font-bold shadow-sm">
                         {current.metrics?.cpp_db > 10 ? 'Voz com boa energia harmônica' : 'Voz com presença de ruído/soprosidade'}
-                      </p>
+                      </div>
                     </div>
-                    <div className="w-16 h-16 rounded-full border-4 border-white/30 flex items-center justify-center opacity-80">
-                      <Activity size={32} />
+                    <div className="relative z-10 w-24 h-24 rounded-full border-4 border-white/20 flex items-center justify-center bg-white/10 backdrop-blur-md shrink-0">
+                      <Activity size={40} className="text-white opacity-80" />
                     </div>
                   </div>
 
-                  {/* PAINEL SEMAFÓRICO */}
-                  <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
-                    <h3 className="text-sm font-bold text-stone-800 mb-4 flex items-center gap-2"><Target className="text-[#D46F54]" size={18}/> Semáforo de Parâmetros Acústicos</h3>
+                  <div className="bg-white border border-stone-200 rounded-3xl p-6 md:p-8 shadow-sm">
+                    <h3 className="text-sm font-bold text-stone-800 mb-6 flex items-center gap-2 border-b border-stone-100 pb-4">
+                      <Target className="text-[#D46F54]" size={18}/> Semáforo de Parâmetros Acústicos
+                    </h3>
                     
-                    <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-4">
-                      {METRIC_LABELS.map(({ key, label, unit, precision }) => {
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                      {VITAL_KEYS.map((key) => {
+                        const mInfo = METRIC_LABELS.find(m => m.key === key);
                         const v = current.metrics?.[key];
                         const cls = classify(key, v);
-                        const display = v == null ? "—" : Number(v).toFixed(precision);
+                        const display = v == null ? "—" : Number(v).toFixed(mInfo.precision);
                         
                         let colorClass = "border-stone-200 bg-white text-stone-700";
                         let Icon = null;
                         
                         if (cls === "warn") {
-                          colorClass = "border-rose-200 bg-rose-50 text-rose-800";
-                          Icon = <AlertCircle size={14} className="text-rose-500" />;
+                          colorClass = "border-red-200 bg-red-50 text-red-800";
+                          Icon = <AlertCircle size={14} className="text-red-500" />;
                         } else if (cls === "ok") {
                           colorClass = "border-emerald-200 bg-emerald-50 text-emerald-800";
-                          Icon = <CheckCircle2 size={14} className="text-emerald-500" />;
                         }
 
                         return (
-                          <div key={key} className={`rounded-xl p-4 transition-all border ${colorClass}`}>
-                            <div className="flex justify-between items-center mb-1">
-                              <span className="text-[10px] uppercase font-bold tracking-widest opacity-70">{label}</span>
+                          <div key={key} className={`rounded-xl p-4 transition-all border relative group ${colorClass}`}>
+                            <div className="flex justify-between items-start mb-1 cursor-help">
+                              <div className="flex items-center gap-1">
+                                <span className={`text-[10px] uppercase font-bold tracking-widest ${cls === 'warn' ? 'text-red-600' : 'text-stone-500'}`}>
+                                  {mInfo.label}
+                                </span>
+                                <HelpCircle size={12} className="text-stone-300 group-hover:text-[#D46F54] transition-colors" />
+                              </div>
                               {Icon}
+                              
+                              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-48 bg-stone-900 text-white text-[10px] leading-relaxed p-2.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl font-medium">
+                                {mInfo.desc}
+                                <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-stone-900"></div>
+                              </div>
                             </div>
-                            <div className="font-heading text-xl font-black mt-1">
-                              {display} <span className="text-xs font-medium opacity-70">{v == null ? "" : unit}</span>
+                            <div className="font-heading text-2xl font-black mt-2">
+                              {display} <span className="text-xs font-normal text-stone-500">{v == null ? "" : mInfo.unit}</span>
                             </div>
                           </div>
                         );
                       })}
                     </div>
-                    <div className="text-[10px] text-stone-400 font-bold uppercase tracking-widest mt-4 flex items-center gap-2"><AlertCircle size={14}/> Verde = Normal | Vermelho = Atenção/Alterado (Base: Teixeira 2013)</div>
+                    <div className="text-[11px] text-stone-400 font-bold uppercase tracking-widest mt-6 flex items-center gap-2">
+                      <Info size={14}/> Verde = Normal | Vermelho = Atenção/Alterado (Base: Teixeira 2013)
+                    </div>
                   </div>
 
-                  {/* DDF E FONETOGRAMA */}
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
-                      <div className="flex justify-between items-center mb-4">
+                    <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm">
+                      <div className="flex justify-between items-center mb-6">
                         <h3 className="text-sm font-bold text-stone-800 flex items-center gap-2"><Activity className="text-emerald-500" size={18}/> Diagrama de Desvio Fonatório (DDF)</h3>
                         <span className="text-[10px] bg-stone-100 px-2 py-1 rounded text-stone-500 font-bold uppercase">Jitter x Shimmer</span>
                       </div>
@@ -443,7 +445,7 @@ export default function VoiceLab() {
                       </div>
                     </div>
 
-                    <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm flex flex-col">
+                    <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm flex flex-col">
                       <h3 className="text-sm font-bold text-stone-800 mb-2 flex items-center gap-2"><AudioLines className="text-blue-500" size={18}/> Fonetograma Simplificado</h3>
                       <p className="text-xs text-stone-500 mb-4">Extensão vocal (Graves/Agudos) e Intensidade (Forte/Fraco).</p>
                       <div className="flex-1 min-h-[250px] w-full border border-dashed border-stone-200 rounded-xl bg-blue-50/20 flex flex-col items-center justify-center text-stone-400">
@@ -455,64 +457,58 @@ export default function VoiceLab() {
                 </div>
               )}
 
-              {/* MODO 2: VISÃO CIENTÍFICA */}
+              {/* MODO CIENTÍFICO */}
               {viewMode === "scientific" && (
                 <div className="space-y-6 animate-in fade-in">
                   
-                  {/* ESPECTROGRAMA INTERATIVO */}
-                  <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
-                     <div className="flex justify-between items-center mb-4">
-                       <h3 className="text-sm font-bold text-stone-800 flex items-center gap-2"><Settings2 className="text-stone-500" size={18}/> Espectrograma Interativo (Gráfico 4D)</h3>
-                     </div>
+                  <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm">
+                    <div className="flex justify-between items-center mb-4">
+                      <h3 className="text-sm font-bold text-stone-800 flex items-center gap-2"><Settings2 className="text-stone-500" size={18}/> Espectrograma Interativo (Gráfico 4D)</h3>
+                    </div>
                      
-                     <div className="bg-stone-900 rounded-2xl p-4 shadow-inner flex flex-col gap-4">
-                       {/* Controles do Doutor */}
-                       <div className="flex flex-wrap items-center justify-between gap-4">
-                          <div className="flex items-center gap-4">
-                            <div className="bg-stone-800 p-2 rounded-lg border border-stone-700">
-                              <label className="text-[10px] font-bold text-stone-400 block mb-1 uppercase tracking-wider">Análise de Banda</label>
-                              <div className="flex gap-1">
-                                <button onClick={() => setSpectroConfig({...spectroConfig, band: 'estreita'})} className={`px-3 py-1 rounded text-xs font-bold transition-colors ${spectroConfig.band === 'estreita' ? 'bg-blue-500 text-white' : 'text-stone-400 hover:bg-stone-700'}`}>Estreita (Harmônicos)</button>
-                                <button onClick={() => setSpectroConfig({...spectroConfig, band: 'larga'})} className={`px-3 py-1 rounded text-xs font-bold transition-colors ${spectroConfig.band === 'larga' ? 'bg-blue-500 text-white' : 'text-stone-400 hover:bg-stone-700'}`}>Larga (Pulsos Glóticos)</button>
-                              </div>
-                            </div>
-                            <div className="bg-stone-800 p-2 rounded-lg border border-stone-700 flex gap-4">
-                              <label className="flex items-center gap-2 cursor-pointer group">
-                                <input type="checkbox" checked={spectroConfig.showF0} onChange={(e) => setSpectroConfig({...spectroConfig, showF0: e.target.checked})} className="accent-blue-500 cursor-pointer w-4 h-4" />
-                                <span className="text-xs font-bold text-stone-300 group-hover:text-white transition-colors">Overlays Pitch (F0)</span>
-                              </label>
-                              <label className="flex items-center gap-2 cursor-pointer group">
-                                <input type="checkbox" checked={spectroConfig.showFormants} onChange={(e) => setSpectroConfig({...spectroConfig, showFormants: e.target.checked})} className="accent-rose-500 cursor-pointer w-4 h-4" />
-                                <span className="text-xs font-bold text-stone-300 group-hover:text-white transition-colors">Formantes (F1-F3)</span>
-                              </label>
-                            </div>
-                          </div>
-                          <Button variant="outline" className="border-stone-700 text-stone-300 hover:text-white hover:bg-stone-800 h-10 px-4">
-                            <Download size={14} className="mr-2" /> Exportar HD
-                          </Button>
+                    <div className="bg-[#1A1817] rounded-2xl p-6 border border-[#2D2A27] shadow-inner flex flex-col">
+                       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+                         <div className="flex items-center gap-4 bg-[#2D2A27] p-1.5 rounded-xl border border-[#3E3A36]">
+                           <span className="text-[10px] font-bold text-stone-400 uppercase tracking-widest pl-3">Análise de Banda</span>
+                           <div className="flex gap-1">
+                             <button onClick={() => setSpectroConfig({...spectroConfig, band: 'estreita'})} className={`px-4 py-2 rounded-lg text-xs font-bold shadow-md transition-colors ${spectroConfig.band === 'estreita' ? 'bg-[#3B82F6] text-white' : 'text-stone-400 hover:text-white hover:bg-[#3E3A36]'}`}>Estreita (Harmônicos)</button>
+                             <button onClick={() => setSpectroConfig({...spectroConfig, band: 'larga'})} className={`px-4 py-2 rounded-lg text-xs font-bold shadow-md transition-colors ${spectroConfig.band === 'larga' ? 'bg-[#3B82F6] text-white' : 'text-stone-400 hover:text-white hover:bg-[#3E3A36]'}`}>Larga (Pulsos Glóticos)</button>
+                           </div>
+                         </div>
+                         <div className="flex items-center gap-6 bg-[#2D2A27] px-4 py-3 rounded-xl border border-[#3E3A36]">
+                           <label className="flex items-center gap-2 cursor-pointer group">
+                             <input type="checkbox" checked={spectroConfig.showF0} onChange={(e) => setSpectroConfig({...spectroConfig, showF0: e.target.checked})} className="accent-blue-500 cursor-pointer w-4 h-4 rounded bg-stone-900 border-stone-700" />
+                             <span className="text-xs font-medium text-stone-300 group-hover:text-white transition-colors">Overlays Pitch (F0)</span>
+                           </label>
+                           <label className="flex items-center gap-2 cursor-pointer group">
+                             <input type="checkbox" checked={spectroConfig.showFormants} onChange={(e) => setSpectroConfig({...spectroConfig, showFormants: e.target.checked})} className="accent-blue-500 cursor-pointer w-4 h-4 rounded bg-stone-900 border-stone-700" />
+                             <span className="text-xs font-medium text-stone-400 group-hover:text-white transition-colors">Formantes (F1-F3)</span>
+                           </label>
+                         </div>
                        </div>
 
-                       {/* MOCK VISUAL DO CANVAS DO ESPECTROGRAMA */}
-                       <div className="h-[350px] w-full bg-black rounded-xl border border-stone-800 relative overflow-hidden flex flex-col justify-center items-center">
-                          <div className="absolute top-2 left-2 text-white/40 text-[10px] font-mono">0.00ms</div>
-                          <div className="absolute top-2 right-2 text-white/40 text-[10px] font-mono">{(current.metrics?.duration_sec || 3).toFixed(2)}s</div>
-                          <div className="absolute bottom-2 left-2 text-white/40 text-[10px] font-mono">0 Hz</div>
-                          <div className="absolute top-2 left-12 text-white/40 text-[10px] font-mono">5000 Hz</div>
-                          
-                          <div className="text-stone-600 flex flex-col items-center">
-                              <SlidersHorizontal size={40} className="mb-2 opacity-50" />
-                              <p className="text-xs font-bold tracking-widest uppercase text-stone-500">Renderizador de Calor Aguardando Backend</p>
-                              <p className="text-[10px] font-mono mt-1 opacity-50 text-stone-500">Ferramenta de seleção de milissegundos ativada.</p>
-                          </div>
-                          {spectroConfig.showF0 && <div className="absolute w-[80%] h-0.5 bg-blue-500/80 left-[10%] top-[60%] blur-[1px] transform rotate-1"></div>}
-                          {spectroConfig.showFormants && <div className="absolute w-[80%] h-3 bg-rose-500/30 left-[10%] top-[40%] blur-[2px]"></div>}
+                       <div className="relative w-full h-[300px] bg-black rounded-xl border border-[#2D2A27] overflow-hidden flex flex-col justify-center items-center">
+                         <span className="absolute top-4 left-4 text-[10px] text-stone-600 font-mono font-bold tracking-widest">0.00ms</span>
+                         <span className="absolute top-4 right-4 text-[10px] text-stone-600 font-mono font-bold tracking-widest">{(current.metrics?.duration_sec || 3).toFixed(2)}s</span>
+                         <span className="absolute bottom-4 left-4 text-[10px] text-stone-600 font-mono font-bold tracking-widest">0 Hz</span>
+                         <span className="absolute top-4 left-16 text-[10px] text-stone-600 font-mono font-bold tracking-widest">5000 Hz</span>
+                         
+                         <div className="text-center space-y-4 relative z-10">
+                           <div className="w-12 h-12 rounded-full border-4 border-stone-800 border-t-blue-500 animate-spin mx-auto"></div>
+                           <h4 className="text-stone-500 font-bold tracking-[0.2em] text-sm uppercase">Renderizador Aguardando Backend</h4>
+                           <p className="text-stone-700 text-xs font-medium tracking-wide">Ferramenta de seleção ativada.</p>
+                         </div>
+
+                         <div className="absolute top-0 left-1/4 w-0.5 h-full bg-blue-500/20 shadow-[0_0_15px_rgba(59,130,246,0.5)] animate-pulse"></div>
+                         <div className="absolute top-1/2 left-0 w-full h-px bg-gradient-to-r from-transparent via-blue-900/50 to-transparent"></div>
                        </div>
-                     </div>
+                    </div>
                   </div>
 
-                  {/* TABELA MDVP COMPLETA */}
-                  <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm overflow-x-auto">
-                    <h3 className="text-sm font-bold text-stone-800 mb-4 flex items-center gap-2"><BookOpen className="text-stone-500" size={16}/> Tabela de Extração Acústica Bruta (MDVP)</h3>
+                  <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm overflow-x-auto">
+                    <h3 className="text-sm font-bold text-stone-800 mb-4 flex items-center gap-2 border-b border-stone-100 pb-4">
+                      <BookOpen className="text-stone-500" size={16}/> Tabela de Extração Acústica Bruta (MDVP)
+                    </h3>
                     <table className="w-full text-left text-sm">
                       <thead className="bg-stone-50 text-stone-500 text-[10px] uppercase tracking-wider font-bold">
                         <tr>
@@ -522,13 +518,20 @@ export default function VoiceLab() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-stone-100 text-stone-700 font-medium">
-                        {METRIC_LABELS.map(({ key, label, unit, precision }) => {
+                        {METRIC_LABELS.map(({ key, label, unit, precision, desc }) => {
                           const v = current.metrics?.[key];
                           return (
-                            <tr key={key} className="hover:bg-stone-50 transition-colors">
-                              <td className="p-4 border-r border-stone-100">{label}</td>
-                              <td className="p-4 font-mono">{v == null ? "—" : Number(v).toFixed(precision)}</td>
-                              <td className="p-4 text-stone-400">{unit}</td>
+                            <tr key={key} className="hover:bg-stone-50 transition-colors group cursor-help relative">
+                              <td className="p-4 border-r border-stone-100 flex items-center gap-2">
+                                {label}
+                                <HelpCircle size={14} className="text-stone-300 opacity-0 group-hover:opacity-100 transition-opacity" />
+                              </td>
+                              <td className="p-4 font-mono font-bold text-stone-800">{v == null ? "—" : Number(v).toFixed(precision)}</td>
+                              <td className="p-4 text-stone-400 text-xs">{unit}</td>
+                              
+                              <div className="absolute bottom-full left-10 mb-1 w-64 bg-stone-900 text-white text-[10px] leading-relaxed p-2.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 shadow-xl font-sans font-normal">
+                                {desc}
+                              </div>
                             </tr>
                           )
                         })}
@@ -539,8 +542,8 @@ export default function VoiceLab() {
                 </div>
               )}
 
-              {/* MÓDULO INFERIOR: DIAGNÓSTICO IA (SEMPRE PRESENTE EM AMBAS AS ABAS) */}
-              <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-sm">
+              {/* DIAGNÓSTICO IA (SEMPRE PRESENTE) */}
+              <div className="bg-white border border-stone-200 rounded-3xl p-6 md:p-8 shadow-sm">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4 border-b border-stone-100 pb-4">
                   <div className="flex items-center gap-3">
                     <div className="bg-indigo-100 p-2.5 rounded-xl text-indigo-600"><Bot size={24}/></div>
