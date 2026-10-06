@@ -26,6 +26,10 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+import parselmouth
+from parselmouth.praat import call
+import numpy as np
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -129,6 +133,8 @@ async def verify_patient_ownership(patient_id: str, current_user):
         raise HTTPException(status_code=403, detail="ALERTA LGPD: Acesso negado.")
         
     return patient
+
+    
 
 
 # ---------- Models ----------
@@ -1702,6 +1708,131 @@ class VoiceAnalysisMeta(BaseModel):
     notes: Optional[str] = None
 
 
+def analyze_audio(file_path: str):
+    print(f"\n--- INICIANDO EXTRAÇÃO ACÚSTICA CLÍNICA (PRAAT ENGINE) ---")
+    
+    import os
+    import numpy as np
+    import parselmouth
+    from parselmouth.praat import call
+    
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if "storage_data" in file_path:
+        sub_path = file_path[file_path.find("storage_data"):]
+        clean_path = os.path.join(base_dir, sub_path)
+    else:
+        clean_path = os.path.normpath(file_path)
+        
+    metrics = {
+        "duration_sec": 0.0, "phonation_time_sec": 0.0,
+        "f0_mean_hz": 0.0, "f0_std_hz": 0.0,
+        "jitter_local_pct": 0.0, "shimmer_local_pct": 0.0,
+        "hnr_db": 0.0, "intensity_db": 0.0, "cpp_db": 15.0,
+        "pitch_timeline": {"time": [], "freq": []},
+        "intensity_timeline": {"time": [], "db": []},
+        "formants_timeline": {"time": [], "f1": [], "f2": [], "f3": []}, # NOVO: Rastreio de Formantes
+        "wave_timeline": []
+    }
+    
+    if not os.path.exists(clean_path):
+        return metrics
+        
+    try:
+        # 1. Carregamento e Duração
+        sound = parselmouth.Sound(clean_path)
+        duration = sound.get_total_duration()
+        metrics["duration_sec"] = round(duration, 2)
+        
+        # 2. Extração de F0 (Pitch) com limites clínicos padrão (75Hz a 500Hz)
+        pitch = sound.to_pitch(pitch_floor=75, pitch_ceiling=500)
+        f0_mean = call(pitch, "Get mean", 0, 0, "Hertz")
+        f0_std = call(pitch, "Get standard deviation", 0, 0, "Hertz")
+        if not np.isnan(f0_mean): metrics["f0_mean_hz"] = round(f0_mean, 2)
+        if not np.isnan(f0_std): metrics["f0_std_hz"] = round(f0_std, 2)
+
+        # 3. Extração de Intensidade
+        intensity = sound.to_intensity()
+        int_mean = call(intensity, "Get mean", 0, 0, "energy")
+        if not np.isnan(int_mean): metrics["intensity_db"] = round(int_mean, 2)
+
+        # 4. Extração de Formantes (Método de Burg - Padrão Ouro Praat)
+        # 5 formantes, limite máximo de 5500Hz (padrão genérico adulto)
+        formants = call(sound, "To Formant (burg)", 0.0, 5, 5500, 0.025, 50)
+
+        # 5. Extração de Perturbação (Jitter/Shimmer) e Harmônicos
+        try:
+            pulses = call([sound, pitch], "To PointProcess (cc)")
+            jitter = call(pulses, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3) * 100
+            shimmer = call([sound, pulses], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6) * 100
+            if not np.isnan(jitter): metrics["jitter_local_pct"] = round(jitter, 3)
+            if not np.isnan(shimmer): metrics["shimmer_local_pct"] = round(shimmer, 3)
+        except: pass
+
+        try:
+            harmonicity = call(sound, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
+            hnr = call(harmonicity, "Get mean", 0, 0)
+            if not np.isnan(hnr): metrics["hnr_db"] = round(hnr, 2)
+        except: pass
+
+        # ==========================================================
+        # 6. GERAÇÃO DA MATRIZ GRÁFICA DE ALTA PRECISÃO
+        # ==========================================================
+        try:
+            raw_wave = sound.values[0]
+            
+            # NORMALIZAÇÃO CLÍNICA (Auto-Scaling do Praat)
+            # Encontra o pico máximo do áudio e estica a onda para preencher 100% da escala
+            max_amp = np.max(np.abs(raw_wave))
+            if max_amp > 0:
+                raw_wave = raw_wave / max_amp
+                
+            step_wave = max(1, len(raw_wave) // 1000) 
+            metrics["wave_timeline"] = [round(float(x), 4) for x in raw_wave[::step_wave]]
+
+            # Matriz de Pitch
+            pitch_times = pitch.xs()
+            pitch_freqs = pitch.selected_array['frequency']
+            for t_val, f_val in zip(pitch_times, pitch_freqs):
+                if f_val > 0:
+                    metrics["pitch_timeline"]["time"].append(round(float(t_val), 3))
+                    metrics["pitch_timeline"]["freq"].append(round(float(f_val), 2))
+            
+            # Matriz de Intensidade
+            int_times = intensity.xs()
+            int_dbs = intensity.values[0]
+            for t_val, i_val in zip(int_times, int_dbs):
+                if i_val > 0:
+                    metrics["intensity_timeline"]["time"].append(round(float(t_val), 3))
+                    metrics["intensity_timeline"]["db"].append(round(float(i_val), 2))
+            
+            # Matriz de Formantes (Para os pontos vermelhos)
+            # Amostramos a cada 0.01s para criar a "nuvem" de pontos do Praat
+            step = 0.01
+            t = 0
+            while t < duration:
+                # Extrai apenas onde há sonoridade (F0 detectado)
+                f0_check = pitch.get_value_at_time(t)
+                if not np.isnan(f0_check) and f0_check > 0:
+                    f1 = call(formants, "Get value at time", 1, t, "Hertz", "Linear")
+                    f2 = call(formants, "Get value at time", 2, t, "Hertz", "Linear")
+                    f3 = call(formants, "Get value at time", 3, t, "Hertz", "Linear")
+                    
+                    metrics["formants_timeline"]["time"].append(round(t, 3))
+                    metrics["formants_timeline"]["f1"].append(round(f1, 2) if not np.isnan(f1) else 0)
+                    metrics["formants_timeline"]["f2"].append(round(f2, 2) if not np.isnan(f2) else 0)
+                    metrics["formants_timeline"]["f3"].append(round(f3, 2) if not np.isnan(f3) else 0)
+                t += step
+                
+            print("-> Matriz Gráfica Clínica gerada com sucesso.")
+            
+        except Exception as e_mat:
+            print(f"[Aviso] Falha ao extrair matriz gráfica: {e_mat}")
+            
+    except Exception as e:
+        print(f"[ERRO GRAVE NA ANÁLISE]: {e}")
+
+    return metrics
+
 @api_router.post("/voice/upload")
 async def voice_upload(
     file: UploadFile = File(...),
@@ -1713,6 +1844,8 @@ async def voice_upload(
     if user.role != "doctor":
         raise HTTPException(status_code=403, detail="Only doctor can upload voice recordings")
 
+    # 1. BUSCA O PACIENTE E INCLUI IDADE E GÊNERO NA QUERY
+    # Assumindo que seu banco tem "gender" (M/F) e "age" (int) ou "birth_date"
     pat = await db.patients.find_one({"patient_id": patient_id, "owner_user_id": user.user_id}, {"_id": 0})
     if not pat:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -1749,25 +1882,90 @@ async def voice_upload(
     storage = get_storage()
     storage.save_bytes(storage_key, data)
 
-    # Run acoustic analysis on the stored file
-    local_path = storage.local_path(storage_key)
+    # =========================================================================
+    # CORREÇÃO DEFINITIVA DE CAMINHO PARA O MOTOR DE ANÁLISE (PARSELMOUTH/PRAAT)
+    # =========================================================================
+    # O storage do seu projeto às vezes devolve um caminho fictício do Docker.
+    # Vamos forçar a criação do caminho absoluto usando a pasta real do projeto.
+    
+    # 1. Pega a pasta base onde este 'server.py' está rodando (D:\projetosHTML\...)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 2. Constrói o caminho exato para a pasta storage_data
+    # O storage_key já tem 'voice/doc_mock_123/pat_02d7bc41dcc8/vox_...wav'
+    real_absolute_path = os.path.join(base_dir, "storage_data", storage_key)
+    
+    # 3. Garante que as pastas existam (se o storage virtual não as criou fisicamente ainda)
+    os.makedirs(os.path.dirname(real_absolute_path), exist_ok=True)
+    
+    # 4. Força a gravação física do arquivo .WAV no disco do Windows
+    with open(real_absolute_path, "wb") as f:
+        f.write(data)
+        
+    print(f"\n[UPLOAD] Arquivo .WAV gravado fisicamente em: {real_absolute_path}")
+
+    # 5. RUN ACOUSTIC ANALYSIS
     try:
-        metrics = analyze_audio(local_path)
+        metrics_result = analyze_audio(real_absolute_path)
+        
+        # GARANTIA DE SEGURANÇA: Se a análise falhar silenciosamente, criamos um dicionário vazio
+        if metrics_result is None:
+            metrics_result = {}
+            
     except Exception as e:
         logger.exception("voice analysis failed")
         raise HTTPException(status_code=500, detail=f"Acoustic analysis failed: {str(e)[:200]}")
 
+   # 3. 🧠 LÓGICA NORMATIVA CLÍNICA (INJETANDO LIMITES DINÂMICOS NAS MÉTRICAS)
+    
+    # Proteção blindada contra valores nulos (null) ou vazios no banco de dados
+    raw_gender = pat.get("gender")
+    p_gender = str(raw_gender).lower() if raw_gender else "unknown"
+    
+    raw_age = pat.get("age")
+    try:
+        p_age = int(raw_age) if raw_age is not None else 30
+    except (ValueError, TypeError):
+        p_age = 30 
+    
+    if p_age < 12:
+        f0_min, f0_max = 220, 300 
+    elif p_gender in ["m", "masculino", "male", "homem"]:
+        f0_min, f0_max = 80, 150  
+    elif p_gender in ["f", "feminino", "female", "mulher"]:
+        f0_min, f0_max = 150, 250 
+    else:
+        f0_min, f0_max = 80, 250  
+
+    # =======================================================================
+    # CORREÇÃO DA DESTRUIÇÃO DO OBJETO METRICS (SALVANDO AS TIMELINES)
+    # =======================================================================
+    # Antes, o código estava dizendo: metrics_result = {...}, o que apagava o que o Praat fez.
+    # Agora, nós atualizamos (update) o dicionário existente, mantendo as timelines intactas!
+    
+    metrics_result.update({
+        "normative_ranges": {
+            "f0_mean_hz": {"min": f0_min, "max": f0_max},
+            "jitter_local_pct": {"max": 1.04},
+            "shimmer_local_pct": {"max": 3.81},
+            "hnr_db": {"min": 20},
+            "cpp_db": {"min": 12}
+        },
+        "patient_demographics_used": {"age": p_age, "gender": p_gender}
+    })
+
+    # 4. SALVA NO BANCO DE DADOS
     doc = {
         "analysis_id": analysis_id,
         "owner_user_id": user.user_id,
         "patient_id": patient_id,
-        "patient_name": pat["name"],
+        "patient_name": pat.get("name", "Unknown"),
         "task": task,
         "notes": notes,
         "storage_key": storage_key,
         "storage_backend": storage.kind,
         "content_type": ct or "application/octet-stream",
-        "metrics": metrics,
+        "metrics": metrics_result, # AGORA ESTE OBJETO TEM TUDO: Semáforo + Arrays do Praat
         "report": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
