@@ -8,6 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
+import PixBillingModal from '../components/PixBillingModal';
 
 // Importação de Ícones (Adicionado Wallet para o Financeiro)
 import { 
@@ -15,7 +16,7 @@ import {
   Phone, Target, Lock, CheckCircle2, XCircle, X, FileClock, Paperclip, BarChart, 
   UploadCloud, File, Image as ImageIcon, Music, Video, Trash2, Download,
   Folder, FolderPlus, FolderOpen, ChevronRight, Eye, Plus, Home, Stethoscope, 
-  CheckSquare, Calendar, Award, Sparkles, LayoutTemplate, Wand2, Save, FileDown, 
+  CheckSquare, Calendar, Award, Sparkles, LayoutTemplate, Wand2, Save, FileDown, CircleDollarSign,
   Bot, PenTool, ClipboardList, ClipboardEdit, RotateCcw, Share2, BrainCircuit, 
   Mic, AlertCircle, ExternalLink, AudioLines, DollarSign, Receipt, TrendingUp, ShieldAlert, Smartphone, Wallet, Table2, Info, HelpCircle
 } from 'lucide-react';
@@ -235,6 +236,7 @@ export default function PatientDetail() {
   const { data: financialData } = useQuery({ queryKey: ["financial", id], queryFn: async () => (await api.get(`/patients/${id}/financial`)).data });
   const { data: voiceLabHistory = [] } = useQuery({ queryKey: ["voice_analysis", id], queryFn: async () => (await api.get(`/voice_analysis?patient_id=${id}`)).data });
   const { data: diariesHistory = [] } = useQuery({ queryKey: ["diaries_history", id], queryFn: async () => (await api.get(`/patients/${id}/diaries`)).data });
+  const [isPixModalOpen, setIsPixModalOpen] = useState(false);
 
   const { data: dbProtocols } = useQuery({
     queryKey: ["protocols", id],
@@ -875,7 +877,23 @@ export default function PatientDetail() {
         </div>
 
         <div className="flex flex-col sm:flex-row md:flex-col gap-2 shrink-0 w-full md:w-auto mt-4 md:mt-0">
-          <Link to={`/voice-lab?patient_id=${p.patient_id}`} className="w-full">
+          {/* O componente do Modal (fica invisível até o estado isPixModalOpen mudar) */}
+          <PixBillingModal 
+            isOpen={isPixModalOpen} 
+            onOpenChange={setIsPixModalOpen} 
+            patientId={id} 
+            patientName={p.name} 
+            patientPhone={p.phone} 
+          />
+          
+          <Button 
+            onClick={() => setIsPixModalOpen(true)}
+            className="w-full justify-start bg-emerald-600 hover:bg-emerald-700 text-white font-bold shadow-sm"
+          >
+            <CircleDollarSign size={16} className="mr-2" /> Cobrar via Pix
+          </Button>
+
+          <Link to={`/voice-lab?patient_id=${id}`} className="w-full">
             <Button variant="outline" className="w-full justify-start border-stone-300">
               <Activity size={16} className="mr-2 text-[#D46F54]" /> Análise Vocal (Gravar)
             </Button>

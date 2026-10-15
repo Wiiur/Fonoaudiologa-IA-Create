@@ -9,9 +9,10 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 import { 
-  HelpCircle, DollarSign, TrendingUp, Clock, CreditCard, Wallet, PiggyBank, Plus, 
-  Link as LinkIcon, Receipt, CheckCircle2, AlertCircle, ArrowUpRight, ArrowDownRight, 
-  Landmark, FileDigit, HeartPulse, QrCode, Send, Building2, FileSpreadsheet, BarChart, BellRing, User
+  HelpCircle, TrendingUp, Clock, Wallet, Plus, 
+  CheckCircle2, ArrowUpRight, ArrowDownRight, 
+  Landmark, FileDigit, HeartPulse, Building2, FileSpreadsheet, BarChart, 
+  ShieldCheck, AlertCircle, Receipt, ClipboardList, Send, User, RefreshCw
 } from 'lucide-react';
 
 const InfoTooltip = ({ title, text }) => (
@@ -28,39 +29,55 @@ const InfoTooltip = ({ title, text }) => (
 export default function FinancialCenter() {
   const qc = useQueryClient();
   const [activeTab, setActiveTab] = useState("dashboard");
-  const [open, setOpen] = useState(false);
   const [openExpense, setOpenExpense] = useState(false);
   const [openTiss, setOpenTiss] = useState(false);
   const [openNfse, setOpenNfse] = useState(false); 
   
-  // ESTADOS DO BANCO (Agora com campo de Destino/Chave Pix)
+  // ESTADOS DO BANCO
   const [saqueAmount, setSaqueAmount] = useState("");
   const [saqueDestination, setSaqueDestination] = useState("");
   
-  const [form, setForm] = useState({ name: "", sessions: 1, amount: 150, patient_id: "none", payment_type: "avulso", auto_reminders: true });
   const [expenseForm, setExpenseForm] = useState({ description: "", amount: "", due_date: new Date().toISOString().split('T')[0] });
   const [tissForm, setTissForm] = useState({ convenio: "Unimed", amount: "", mes_referencia: "" });
   const [nfseForm, setNfseForm] = useState({ patient_id: "none", cpf: "", service: "Sessão de Fonoaudiologia", amount: "" });
 
-  const { data: packages = [] } = useQuery({ queryKey: ["packages"], queryFn: async () => (await api.get("/packages")).data });
   const { data: patients = [] } = useQuery({ queryKey: ["patients"], queryFn: async () => (await api.get("/patients")).data });
   const { data: dashboardData } = useQuery({ queryKey: ["finance_dashboard"], queryFn: async () => (await api.get("/finance/dashboard")).data });
   const { data: covenants = [] } = useQuery({ queryKey: ["covenants"], queryFn: async () => (await api.get("/finance/covenants")).data });
   const { data: nfseList = [] } = useQuery({ queryKey: ["nfse"], queryFn: async () => (await api.get("/finance/nfse")).data });
-  const { data: bankData } = useQuery({ queryKey: ["bank"], queryFn: async () => (await api.get("/finance/bank/statement")).data });
+  
+  // Busca o Saldo na Rota Nova
+  const { data: balanceData, isLoading: isBankLoading } = useQuery({ queryKey: ['finance_balance'], queryFn: async () => (await api.get('/finance/balance')).data });
+  const { data: withdrawalsHistory = [] } = useQuery({ queryKey: ['withdrawals_history'], queryFn: async () => (await api.get('/finance/bank/statement')).data.historico || [] });
+  const { data: vaultConfig } = useQuery({ queryKey: ['vault_config'], queryFn: async () => (await api.get('/finance/vault')).data });
+  
+  // Busca a lista de pacotes/cobranças para a aba "Controle de Mensalidades"
+  const { data: packages = [] } = useQuery({ queryKey: ["packages"], queryFn: async () => (await api.get("/packages")).data });
 
-  const create = useMutation({
-    mutationFn: async () => {
-      const payload = { ...form, sessions: Number(form.sessions), amount: Number(form.amount), patient_id: form.patient_id === "none" ? null : form.patient_id };
-      return (await api.post("/packages", payload)).data;
-    },
+  const markAsPaidManual = useMutation({
+    mutationFn: async (pkgId) => (await api.put(`/packages/${pkgId}/pay`)).data,
     onSuccess: () => {
-      toast.success("Orçamento gerado e salvo no banco de dados!");
-      qc.invalidateQueries({ queryKey: ["packages", "finance_dashboard"] });
-      setOpen(false);
-      setForm({ name: "", sessions: 1, amount: 150, patient_id: "none", payment_type: "avulso", auto_reminders: true });
-    },
+      toast.success("Baixa manual realizada! O sistema já contabilizou este valor como Receita.");
+      qc.invalidateQueries({ queryKey: ["packages", "finance_dashboard", "finance_balance"] });
+    }
   });
+
+  // Função para sincronizar pagamentos Pix direto com o Asaas (Teste em Localhost)
+  const syncPixPayments = useMutation({
+    mutationFn: async () => (await api.post("/finance/pix/sync")).data,
+    onSuccess: (data) => {
+      if (data.updated > 0) {
+        toast.success(data.msg);
+      } else {
+        toast.info("Nenhuma nova confirmação de Pix encontrada no banco ainda.");
+      }
+      qc.invalidateQueries({ queryKey: ["packages", "finance_dashboard", "finance_balance"] });
+    },
+    onError: (err) => {
+      toast.error(err.response?.data?.detail || "Erro ao sincronizar com o banco Asaas.");
+    }
+  });
+
 
   const createExpense = useMutation({
     mutationFn: async () => (await api.post("/finance/expenses", { ...expenseForm, amount: Number(expenseForm.amount) })).data,
@@ -103,52 +120,28 @@ export default function FinancialCenter() {
     }
   });
 
-  // MUTAÇÃO ATUALIZADA DO SAQUE (AGORA ENVIA A CHAVE PIX)
   const requestWithdrawal = useMutation({
     mutationFn: async () => (await api.post("/finance/bank/withdraw", { amount: Number(saqueAmount), destination: saqueDestination })).data,
     onSuccess: () => { 
       toast.success("Saque solicitado! O valor cairá na sua conta em breve."); 
-      qc.invalidateQueries({ queryKey: ["bank", "finance_dashboard"] }); 
+      qc.invalidateQueries({ queryKey: ["finance_balance", "withdrawals_history"] }); 
       setSaqueAmount(""); 
       setSaqueDestination(""); 
+    },
+    onError: (error) => {
+      toast.error(error.response?.data?.detail || 'Erro ao solicitar saque.');
     }
   });
 
-  const startCheckout = async (pkg) => {
-    try {
-      const { data } = await api.post("/packages/checkout", { package_id: pkg.package_id, origin_url: window.location.origin });
-      qc.invalidateQueries({ queryKey: ["packages"] }); 
-      return data.url; 
-    } catch { toast.error("Erro de comunicação com o servidor bancário."); return null; }
-  };
-
-  const handleOpenCheckout = async (pkg) => {
-    let url = pkg.checkout_url;
-    if (!url) { toast.info("Gerando link seguro e oficial..."); url = await startCheckout(pkg); }
-    if (url) window.open(url, "_blank");
-  };
-
-  const handleChargeWhatsApp = async (pkg) => {
-    let url = pkg.checkout_url;
-    if (!url) {
-      toast.info("Aguarde, conectando ao banco para gerar o link oficial...");
-      url = await startCheckout(pkg);
-    }
-    if (!url) return;
-
-    const patient = patients.find(p => p.patient_id === pkg.patient_id);
-    const pName = patient?.name?.split(" ")[0] || "Paciente";
-    const phone = patient?.phone ? patient.phone.replace(/\D/g, '') : ""; 
+  const handleWithdraw = (e) => {
+    e.preventDefault();
+    const amount = parseFloat(saqueAmount.replace(',', '.'));
     
-    const msg = `Olá, ${pName}! Tudo bem?\n\nAqui é da clínica. Segue o link seguro para pagamento referente a: *${pkg.name}* (Valor: R$ ${Number(pkg.amount).toFixed(2)}).\n\nNeste link oficial você pode optar por pagar via Pix, Boleto ou Cartão de Crédito de forma 100% segura:\n🔗 ${url}\n\nQualquer dúvida, estamos à disposição!`;
-    
-    if (phone) {
-      window.open(`https://wa.me/55${phone}?text=${encodeURIComponent(msg)}`, '_blank');
-      toast.success("Abrindo o WhatsApp do paciente...");
-    } else {
-      navigator.clipboard.writeText(msg);
-      toast.warning("Paciente sem telefone cadastrado! Mensagem copiada, cole onde preferir.");
-    }
+    if (isNaN(amount) || amount <= 0) return toast.error('Insira um valor válido.');
+    if (amount > (balanceData?.available_balance || 0)) return toast.error('Saldo insuficiente para este saque.');
+    if (vaultConfig?.status !== 'configured') return toast.error('Configure o seu Cofre (em Configurações) primeiro.');
+
+    requestWithdrawal.mutate();
   };
 
   const handleDownloadXML = (c) => {
@@ -230,7 +223,7 @@ export default function FinancialCenter() {
           </div>
           <h1 className="font-heading text-3xl font-bold text-stone-800">
             Gestão & Faturamento
-            <InfoTooltip title="O que é esta tela?" text="Este é o painel de controle financeiro da sua clínica. Aqui você para de usar planilhas de papel. O sistema cruza os orçamentos que você envia para os pacientes com o dinheiro que cai na sua conta digital (Psicobank), gerando gráficos automáticos e avisos de quem está devendo." />
+            <InfoTooltip title="O que é esta tela?" text="Este é o painel de controle financeiro da sua clínica. Aqui o sistema cruza os orçamentos que você envia para os pacientes com o dinheiro que cai na sua conta digital (Psicobank), gerando gráficos automáticos e balanços de recebimento." />
           </h1>
         </div>
       </div>
@@ -238,7 +231,7 @@ export default function FinancialCenter() {
       <div className="flex overflow-x-auto border-b border-stone-200 custom-scrollbar mb-8">
         {[
           { id: "dashboard", label: "Visão Geral & Gráficos", icon: TrendingUp },
-          { id: "billing", label: "Planos & Cobranças", icon: QrCode },
+          { id: "control", label: "Controle de Mensalidades", icon: ClipboardList },
           { id: "covenants", label: "Convênios & Repasses", icon: HeartPulse },
           { id: "fiscal", label: "Fiscal & NFSe", icon: FileDigit },
           { id: "bank", label: "Psicobank (Conta)", icon: Wallet },
@@ -260,9 +253,9 @@ export default function FinancialCenter() {
             <div className="bg-emerald-50 border border-emerald-100 rounded-3xl p-6 shadow-sm">
               <div className="text-xs font-bold text-emerald-700 uppercase tracking-widest mb-1 flex items-center">
                 Receitas (Entradas) 
-                <InfoTooltip title="O que são Receitas?" text="Dinheiro que já caiu de verdade na sua conta. Quando o paciente paga o link que você enviou, o sistema soma esse valor aqui e marca o plano dele como 'Quitado'." />
+                <InfoTooltip title="O que são Receitas?" text="Dinheiro que já caiu na conta." />
               </div>
-              <div className="font-heading text-4xl font-bold text-emerald-800 mt-3">{formatCurrency(dashboardData?.total_revenue)}</div>
+              <div className="font-heading text-4xl font-bold text-emerald-800 mt-3">{formatCurrency(balanceData?.total_earned)}</div>
               <div className="text-xs text-emerald-600 font-medium mt-2 flex items-center gap-1"><ArrowUpRight size={12}/> Dinheiro no caixa</div>
             </div>
 
@@ -270,7 +263,6 @@ export default function FinancialCenter() {
               <div className="flex justify-between items-start">
                 <div className="text-xs font-bold text-rose-700 uppercase tracking-widest mb-1 flex items-center">
                   Despesas (A Pagar) 
-                  <InfoTooltip title="Por que registrar despesas?" text="As despesas são os custos fixos ou variáveis da clínica, como aluguel, internet, ou pagamento de secretárias. É fundamental registrá-las aqui para que o sistema possa cruzar com as Entradas e calcular se você está tendo Lucro ou Prejuízo." />
                 </div>
                 <Dialog open={openExpense} onOpenChange={setOpenExpense}>
                   <DialogTrigger asChild>
@@ -287,16 +279,16 @@ export default function FinancialCenter() {
                   </DialogContent>
                 </Dialog>
               </div>
-              <div className="font-heading text-4xl font-bold text-rose-800 mt-3">{formatCurrency(dashboardData?.total_expenses)}</div>
+              <div className="font-heading text-4xl font-bold text-rose-800 mt-3">{formatCurrency(balanceData?.total_expenses)}</div>
               <div className="text-xs text-rose-600 font-medium mt-2 flex items-center gap-1"><ArrowDownRight size={12}/> Vencimentos registrados</div>
             </div>
 
             <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm">
               <div className="text-xs font-bold text-stone-500 uppercase tracking-widest mb-1 flex items-center">
                 A Receber (Pendentes)
-                <InfoTooltip title="O que é Dinheiro A Receber?" text="Dinheiro que é seu, mas ainda está 'na rua'. São os links de pagamento de pacotes e mensalidades que você já gerou no sistema, mas o paciente não pagou o link ainda." />
+                <InfoTooltip title="O que é Dinheiro A Receber?" text="Dinheiro que é seu, mas ainda está 'na rua'. Cobranças geradas pelo paciente e não pagas." />
               </div>
-              <div className="font-heading text-4xl font-bold text-stone-800 mt-3">{formatCurrency(dashboardData?.total_pending)}</div>
+              <div className="font-heading text-4xl font-bold text-stone-800 mt-3">{formatCurrency(balanceData?.total_pending)}</div>
               <div className="text-xs text-stone-400 font-medium mt-2 flex items-center gap-1"><Clock size={12}/> Faturas pendentes</div>
             </div>
           </div>
@@ -347,102 +339,60 @@ export default function FinancialCenter() {
         </div>
       )}
 
-      {/* ABA 2: PLANOS E COBRANÇAS */}
-      {activeTab === "billing" && (
+      {/* ABA: CONTROLE DE MENSALIDADES E INADIMPLÊNCIA */}
+      {activeTab === "control" && (
         <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4">
-          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-white p-6 rounded-3xl border border-stone-200 shadow-sm gap-4">
+          <div className="bg-white p-6 rounded-3xl border border-stone-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
             <div>
-              <h2 className="font-bold text-lg text-stone-800 flex items-center gap-2">Gestão de Cobranças <InfoTooltip title="Como cobrar o paciente?" text="Clique no botão Laranja para criar uma cobrança. O sistema vai te devolver um Link Oficial. O paciente clica no link pelo celular dele, e lá dentro ele decide se quer pagar via Pix (gera QR Code na hora), Boleto Bancário oficial, ou Cartão de Crédito." /></h2>
-              <p className="text-sm text-stone-500 mt-1">Gere links de pagamento e diminua a inadimplência com a IA.</p>
+              <h2 className="font-bold text-lg text-stone-800 flex items-center gap-2">
+                <ClipboardList className="text-[#D46F54]" /> Monitor de Inadimplência & Pagamentos
+              </h2>
+              <p className="text-sm text-stone-500 mt-1">Acompanhe quem já pagou, quem está atrasado e sincronize pagamentos Pix em tempo real.</p>
             </div>
             
-            <Dialog open={open} onOpenChange={setOpen}>
-              <DialogTrigger asChild>
-                <Button className="bg-[#D46F54] hover:bg-[#B75C46] text-white rounded-xl h-11 w-full sm:w-auto"><Plus size={18} className="mr-2" /> Nova Cobrança</Button>
-              </DialogTrigger>
-              <DialogContent className="max-w-xl bg-stone-50 rounded-2xl p-0 border-stone-200 w-[95vw] overflow-y-auto max-h-[90vh]">
-                <DialogHeader className="bg-white p-6 border-b border-stone-200"><DialogTitle className="font-heading text-xl text-stone-800">Setup de Cobrança Oficial</DialogTitle></DialogHeader>
-                <div className="p-6 space-y-6">
-                  
-                  <div className="space-y-4">
-                    <h3 className="text-xs uppercase tracking-widest text-stone-500 font-bold flex items-center gap-2 border-b border-stone-200 pb-2"><User size={14}/> 1. Quem é o paciente?</h3>
-                    <div>
-                      <Select value={form.patient_id} onValueChange={(v) => {
-                        setForm({ ...form, patient_id: v });
-                        if(v !== "none") {
-                          const pName = patients.find(p => p.patient_id === v)?.name.split(" ")[0];
-                          if(pName) setForm(prev => ({...prev, name: `Terapia - ${pName}`}));
-                        }
-                      }}>
-                        <SelectTrigger className="h-11 bg-white"><SelectValue placeholder="Selecione o paciente cadastrado" /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="none">Cobrança Avulsa / Sem Cadastro</SelectItem>
-                          {patients.map((p) => <SelectItem key={p.patient_id} value={p.patient_id}>{p.name}</SelectItem>)}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
+            <div className="flex flex-wrap items-center gap-4 w-full md:w-auto justify-between md:justify-end">
+              <div className="flex items-center gap-4 text-sm font-bold">
+                <div className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-emerald-500"></span> Pagos</div>
+                <div className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-amber-500"></span> Pendentes</div>
+              </div>
 
-                  <div className="space-y-4">
-                    <h3 className="text-xs uppercase tracking-widest text-stone-500 font-bold flex items-center gap-2 border-b border-stone-200 pb-2">
-                      <CreditCard size={14}/> 2. Formato e Valores
-                    </h3>
-                    
-                    <Select value={form.payment_type} onValueChange={(v) => setForm({ ...form, payment_type: v, sessions: v === "avulso" ? 1 : form.sessions })}>
-                      <SelectTrigger className="h-11 bg-white"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="avulso">Sessão Avulsa (Pagamento Único)</SelectItem>
-                        <SelectItem value="pacote">Pacote Fechado (Ex: 10 Sessões pagas juntas)</SelectItem>
-                        <SelectItem value="mensal">Mensalidade Recorrente</SelectItem>
-                        <SelectItem value="semanal">Semanal Recorrente</SelectItem>
-                      </SelectContent>
-                    </Select>
-
-                    <Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="h-11 bg-white" placeholder="Nome que aparecerá na fatura (Ex: Fonoaudiologia)" />
-
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <Label className="text-xs font-bold text-stone-600 mb-1.5 block">Qtd Sessões</Label>
-                        <Input type="number" min="1" disabled={form.payment_type === 'avulso'} value={form.sessions} onChange={(e) => setForm({ ...form, sessions: e.target.value })} className="h-11 bg-white" />
-                      </div>
-                      <div>
-                        <Label className="text-xs font-bold text-stone-600 mb-1.5 block">Valor a Cobrar (R$)</Label>
-                        <Input type="number" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} className="h-11 bg-white" />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
-                    <h3 className="text-xs uppercase tracking-widest text-stone-500 font-bold flex items-center gap-2 border-b border-stone-200 pb-2"><BellRing size={14}/> 3. Prevenção de Inadimplência</h3>
-                    <div className="bg-white border border-stone-200 p-4 rounded-xl flex items-center justify-between shadow-sm">
-                      <div className="pr-4">
-                        <Label className="text-sm font-bold text-stone-800">Lembrete Inteligente (Assistente IA)</Label>
-                        <p className="text-[11px] text-stone-500 font-medium leading-relaxed mt-1">Mantenha a amizade com o paciente! Deixe marcado para a assistente robô enviar a cobrança automática no WhatsApp caso ele atrase o pagamento em 48h.</p>
-                      </div>
-                      <input type="checkbox" className="w-5 h-5 accent-[#D46F54] cursor-pointer" checked={form.auto_reminders} onChange={(e) => setForm({...form, auto_reminders: e.target.checked})} />
-                    </div>
-                  </div>
-
-                  <Button onClick={() => create.mutate()} disabled={!form.name || create.isPending} className="w-full bg-stone-900 hover:bg-black text-white font-bold h-12 rounded-xl mt-4 shadow-md transition-transform hover:scale-[1.01]">
-                    {create.isPending ? "Salvando no Banco..." : "Emitir Cobrança"}
-                  </Button>
-                </div>
-              </DialogContent>
-            </Dialog>
+              <Button 
+                onClick={() => syncPixPayments.mutate()} 
+                disabled={syncPixPayments.isPending}
+                variant="outline"
+                className="border-emerald-200 bg-emerald-50/50 text-emerald-700 hover:bg-emerald-100 font-bold rounded-xl h-10 px-4"
+              >
+                <RefreshCw size={15} className={`mr-2 ${syncPixPayments.isPending ? "animate-spin" : ""}`} />
+                {syncPixPayments.isPending ? "Consultando Banco..." : "Sincronizar Pix (Asaas)"}
+              </Button>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+            {packages.length === 0 && <div className="col-span-full py-12 text-center text-stone-400 italic">Nenhuma cobrança gerada ainda. Vá no perfil de um paciente para cobrar.</div>}
+            
             {packages.map((p) => {
               const isPaid = p.status === "paid";
+              const patientName = patients.find(pat => pat.patient_id === p.patient_id)?.name || "Paciente Avulso";
+              const patientPhone = patients.find(pat => pat.patient_id === p.patient_id)?.phone?.replace(/\D/g, '') || "";
+
+              const handleSendReminder = () => {
+                const msg = `Olá, ${patientName.split(" ")[0]}! Passando para lembrar sobre o pagamento do plano: *${p.name}* (R$ ${Number(p.amount).toFixed(2)}).\n\nQualquer dúvida, estamos à disposição!`;
+                if (patientPhone) window.open(`https://wa.me/55${patientPhone}?text=${encodeURIComponent(msg)}`, '_blank');
+                else { navigator.clipboard.writeText(msg); toast.warning("Sem telefone. Mensagem copiada!"); }
+              };
+
               return (
-                <div key={p.package_id} className={`bg-white border rounded-3xl p-6 flex flex-col h-full shadow-sm transition-all hover:shadow-md ${isPaid ? 'border-emerald-100 bg-emerald-50/20' : 'border-stone-200 hover:border-[#D46F54]/50'}`}>
+                <div key={p.package_id} className={`bg-white border rounded-3xl p-6 flex flex-col h-full shadow-sm transition-all hover:shadow-md ${isPaid ? 'border-emerald-200' : 'border-amber-200'}`}>
                   <div className="flex items-start justify-between mb-4 border-b border-stone-100 pb-4">
                     <div>
                       <div className="flex items-center gap-2 mb-2">
-                        <span className="bg-stone-100 text-stone-600 text-[9px] font-bold px-2 py-0.5 rounded uppercase tracking-widest">{p.payment_type || 'Pacote'}</span>
-                        {p.sessions > 1 && <span className="bg-indigo-50 text-indigo-600 text-[9px] font-bold px-2 py-0.5 rounded uppercase tracking-widest">{p.sessions} sessões</span>}
+                        <span className="bg-stone-100 text-stone-600 text-[9px] font-bold px-2 py-0.5 rounded uppercase tracking-widest">{p.payment_type || 'Plano'}</span>
                       </div>
-                      <h3 className="font-bold text-stone-800 text-lg leading-tight">{p.name}</h3>
+                      <h3 className="font-bold text-stone-800 text-base leading-tight truncate">{p.name}</h3>
+                      <div className="mt-2 flex items-center gap-2 text-[11px] font-bold text-stone-500">
+                        <User size={12} className="text-[#D46F54]" /> {patientName}
+                      </div>
                     </div>
                     <div className={`shrink-0 px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold flex items-center gap-1.5 border ${isPaid ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-amber-50 text-amber-700 border-amber-200"}`}>
                       {isPaid ? <><CheckCircle2 size={12}/> Quitado</> : <><Clock size={12}/> Pendente</>}
@@ -450,29 +400,34 @@ export default function FinancialCenter() {
                   </div>
                   
                   <div className="flex-1">
-                    <div className="text-[10px] uppercase tracking-widest text-stone-400 font-bold mb-1">Valor Total</div>
                     <div className="font-heading text-3xl font-bold text-stone-800">{formatCurrency(Number(p.amount))}</div>
-                    {p.patient_id && (
-                      <div className="mt-3 flex items-center gap-2 text-[11px] font-bold text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-100">
-                        <User size={14} className="text-stone-400" />
-                        Paciente: {patients.find(pat => pat.patient_id === p.patient_id)?.name || "Cliente"}
-                      </div>
+                    {isPaid && p.payment_method === 'manual' && (
+                      <p className="text-[10px] text-stone-400 font-bold uppercase mt-2 border border-stone-100 bg-stone-50 px-2 py-1 rounded w-fit">Baixa Manual Efetuada</p>
                     )}
                   </div>
                   
                   <div className="mt-6 pt-4 border-t border-stone-100 space-y-2">
-                    <Button 
-                      onClick={() => handleOpenCheckout(p)} 
-                      className={`w-full h-11 font-bold rounded-xl shadow-sm transition-all ${isPaid ? 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100' : 'bg-stone-900 hover:bg-black text-white hover:scale-[1.02]'}`}
-                    >
-                      {isPaid ? <><Receipt className="mr-2" size={16} /> Ver Recibo Oficial</> : <><CreditCard className="mr-2" size={16} /> Ver Checkout Oficial (Link)</>}
-                    </Button>
-                    {!isPaid && (
-                      <div className="flex gap-2">
-                        <Button variant="outline" onClick={() => handleChargeWhatsApp(p)} className="flex-1 h-10 text-[11px] uppercase tracking-wider font-bold border-emerald-200 text-emerald-700 hover:bg-emerald-50">
-                          <Send size={14} className="mr-1.5"/> Cobrar Whats
+                    {!isPaid ? (
+                      <div className="flex flex-col gap-2">
+                        <Button 
+                          onClick={() => {
+                            if(window.confirm("Tem certeza que o paciente já pagou este valor (ex: em dinheiro/maquininha na clínica)?")) {
+                              markAsPaidManual.mutate(p.package_id);
+                            }
+                          }}
+                          disabled={markAsPaidManual.isPending}
+                          className="w-full h-10 text-xs font-bold rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm transition-transform hover:scale-[1.02]"
+                        >
+                          <CheckCircle2 className="mr-2" size={14} /> Dar Baixa Manual (Marcar Pago)
+                        </Button>
+                        <Button variant="outline" onClick={handleSendReminder} className="w-full h-9 text-[11px] uppercase tracking-wider font-bold border-amber-200 text-amber-700 hover:bg-amber-50 rounded-xl">
+                          <Send size={14} className="mr-1.5"/> Enviar Lembrete Whats
                         </Button>
                       </div>
+                    ) : (
+                      <Button variant="outline" className="w-full h-10 text-xs font-bold rounded-xl border-stone-200 text-stone-400 cursor-not-allowed">
+                        <Receipt className="mr-2" size={14} /> Pagamento já finalizado
+                      </Button>
                     )}
                   </div>
                 </div>
@@ -482,13 +437,13 @@ export default function FinancialCenter() {
         </div>
       )}
 
-      {/* ABA 3: CONVÊNIOS E REPASSES */}
+      {/* ABA 2: CONVÊNIOS E REPASSES */}
       {activeTab === "covenants" && (
         <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4">
           <div className="bg-indigo-50 border border-indigo-100 rounded-3xl p-6 shadow-sm flex gap-4 items-center">
             <HeartPulse size={32} className="text-indigo-500 shrink-0"/>
             <div>
-              <h2 className="font-bold text-lg text-indigo-900">Gestão de Convênios <InfoTooltip title="Lotes TISS / TUSS" text="Se a sua clínica atende plano de saúde, use esta aba para gerar os relatórios em formato XML (TISS) para mandar para a operadora, além de configurar quanto vai ser o repasse da clínica para outros profissionais da sua equipe." /></h2>
+              <h2 className="font-bold text-lg text-indigo-900">Gestão de Convênios <InfoTooltip title="Lotes TISS / TUSS" text="Se a sua clínica atende plano de saúde, use esta aba para gerar os relatórios em formato XML (TISS) para mandar para a operadora." /></h2>
             </div>
           </div>
           
@@ -496,7 +451,6 @@ export default function FinancialCenter() {
             <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm flex flex-col h-full">
               <div className="flex justify-between items-center mb-4 border-b border-stone-100 pb-3">
                 <h3 className="font-bold text-stone-800">Lotes de Convênio (A Receber)</h3>
-                
                 <Dialog open={openTiss} onOpenChange={setOpenTiss}>
                   <DialogTrigger asChild>
                     <Button variant="outline" className="h-8 text-xs font-bold border-indigo-200 text-indigo-600 hover:bg-indigo-50"><Plus size={12} className="mr-1"/> Novo Lote</Button>
@@ -551,7 +505,7 @@ export default function FinancialCenter() {
             </div>
 
             <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm">
-              <h3 className="font-bold text-stone-800 mb-4 border-b border-stone-100 pb-3 flex items-center gap-2">Repasses e Comissões <InfoTooltip title="Cálculo Automático" text="No final do mês, o sistema soma todo o dinheiro que os pacientes pagaram e divide automaticamente a parte da Clínica (Ex: 30%) e a parte do Fonoaudiólogo (Ex: 70%). Clique no botão preto para baixar a folha em formato PDF." /></h3>
+              <h3 className="font-bold text-stone-800 mb-4 border-b border-stone-100 pb-3 flex items-center gap-2">Repasses e Comissões <InfoTooltip title="Cálculo Automático" text="No final do mês, o sistema soma todo o dinheiro que os pacientes pagaram e divide automaticamente a parte da Clínica e do Fonoaudiólogo." /></h3>
               <div className="p-4 border border-indigo-100 bg-indigo-50/30 rounded-xl mb-4">
                 <div className="text-xs font-bold text-stone-500 uppercase mb-1">Regra Padrão da Clínica</div>
                 <div className="font-bold text-indigo-800">Clínica: 30% | Profissional: 70%</div>
@@ -562,18 +516,16 @@ export default function FinancialCenter() {
         </div>
       )}
 
-      {/* ABA 4: FISCAL E NFSE */}
+      {/* ABA 3: FISCAL E NFSE */}
       {activeTab === "fiscal" && (
         <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             
-            {/* JANELA DE EMISSÃO DE NFSe */}
             <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm flex flex-col justify-between">
               <div>
                 <div className="flex justify-between items-start mb-2">
-                  <h3 className="font-bold text-stone-800 text-lg flex items-center gap-2"><Receipt className="text-[#D46F54]"/> Emissão de Notas (NFSe) <InfoTooltip title="Notas Fiscais de Serviço" text="O sistema emite a Nota Fiscal Eletrônica conectando-se diretamente à prefeitura, usando os dados que você preencher." /></h3>
+                  <h3 className="font-bold text-stone-800 text-lg flex items-center gap-2"><Receipt className="text-[#D46F54]"/> Emissão de Notas (NFSe)</h3>
                   
-                  {/* MODAL DE EMISSÃO DA NOTA */}
                   <Dialog open={openNfse} onOpenChange={setOpenNfse}>
                     <DialogTrigger asChild>
                       <Button className="bg-[#D46F54] hover:bg-[#B75C46] text-white h-9 font-bold rounded-xl text-xs"><Plus size={14} className="mr-1"/> Nova NFSe</Button>
@@ -619,10 +571,9 @@ export default function FinancialCenter() {
               </div>
             </div>
             
-            {/* JANELA DMED / RECEITA FEDERAL */}
             <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm flex flex-col">
               <div>
-                <h3 className="font-bold text-stone-800 text-lg flex items-center gap-2 mb-2"><Building2 className="text-emerald-600"/> Integração Carnê-Leão <InfoTooltip title="Sincronização Receita Federal" text="A Receita Federal exige que profissionais de saúde informem anualmente os CPFs e os valores pagos de todos os pacientes. Este botão pega o histórico do ano inteiro do banco de dados e cria o Lote (Planilha CSV) formato DMED/Carnê-Leão com um clique, poupando trabalho do seu contador." /></h3>
+                <h3 className="font-bold text-stone-800 text-lg flex items-center gap-2 mb-2"><Building2 className="text-emerald-600"/> Integração Carnê-Leão</h3>
                 <p className="text-sm text-stone-500 mb-6">Sincronize os dados (CPF e Valores) gerando a planilha de exportação para a Receita Federal.</p>
               </div>
               <Button onClick={handleDownloadDMED} variant="outline" className="w-full border-emerald-200 text-emerald-700 hover:bg-emerald-50 h-11 font-bold rounded-xl mt-auto transition-colors">
@@ -633,20 +584,30 @@ export default function FinancialCenter() {
         </div>
       )}
 
-      {/* ABA 5: PSICOBANK / CONTA DIGITAL */}
+      {/* ABA 4: PSICOBANK / CONTA DIGITAL */}
       {activeTab === "bank" && (
-        <div className="max-w-2xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 mt-4">
+        <div className="max-w-3xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 mt-4">
+          
+          {vaultConfig?.status !== 'configured' && (
+            <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl flex items-start gap-3">
+              <AlertCircle size={20} className="text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <h4 className="font-bold text-amber-800">Conta de Recebimento não configurada</h4>
+                <p className="text-sm text-amber-700 mt-1">Para realizar saques, vá em <strong>Administração {">"} Configurações & Equipe {">"} Cofre</strong> e cadastre seu Banco ou Chave PIX.</p>
+              </div>
+            </div>
+          )}
+
           <div className="bg-gradient-to-br from-stone-900 to-stone-800 rounded-3xl p-8 shadow-2xl text-white relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-64 h-64 bg-white opacity-5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/3"></div>
+            <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-500 opacity-10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/3 pointer-events-none"></div>
             <div className="flex justify-between items-start mb-12 relative z-10">
               <div className="text-sm font-bold text-stone-400 uppercase tracking-widest flex items-center gap-2">
-                <Wallet size={16}/> Psicobank Digital <InfoTooltip title="Seu Dinheiro" text="Todos os links de Pix e Cartão que você envia para os pacientes, quando são pagos, ficam guardados nesta conta digital oficial da clínica. Daqui, você pode sacar para o seu Banco (Nubank, Itaú) a hora que quiser via PIX." />
+                <Wallet size={16}/> Conta Digital (Psicobank)
               </div>
-              <div className="text-xl font-heading font-bold text-stone-500 italic">VoxBank</div>
             </div>
             <div className="relative z-10">
               <p className="text-sm text-stone-400 font-medium mb-1">Saldo Disponível para Saque</p>
-              <h2 className="text-5xl font-heading font-bold">{formatCurrency(bankData?.saldo)}</h2>
+              <h2 className="text-5xl font-heading font-bold">{formatCurrency(balanceData?.available_balance || 0)}</h2>
             </div>
           </div>
 
@@ -655,45 +616,63 @@ export default function FinancialCenter() {
               <ArrowUpRight className="text-emerald-600" size={18} /> Efetuar Transferência (Pix)
             </h3>
             
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-              <div>
-                <Label className="text-xs font-bold text-stone-600 mb-1.5 block">Valor do Saque (R$)</Label>
-                <Input type="number" placeholder="Ex: 150.00" value={saqueAmount} onChange={e => setSaqueAmount(e.target.value)} className="h-12 bg-stone-50 border-stone-200 text-lg" />
+            <form onSubmit={handleWithdraw}>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <Label className="text-xs font-bold text-stone-600 mb-1.5 block">Valor do Saque (R$)</Label>
+                  <Input type="number" step="0.01" placeholder="Ex: 150.00" value={saqueAmount} onChange={e => setSaqueAmount(e.target.value)} className="h-12 bg-stone-50 border-stone-200 text-lg" />
+                </div>
+                <div>
+                  <Label className="text-xs font-bold text-stone-600 mb-1.5 block">Chave Pix de Destino</Label>
+                  <Input type="text" placeholder="CPF, E-mail, Celular ou Aleatória" value={saqueDestination} onChange={e => setSaqueDestination(e.target.value)} className="h-12 bg-stone-50 border-stone-200" />
+                </div>
               </div>
-              <div>
-                <Label className="text-xs font-bold text-stone-600 mb-1.5 block">Chave Pix de Destino</Label>
-                <Input type="text" placeholder="CPF, E-mail, Celular ou Aleatória" value={saqueDestination} onChange={e => setSaqueDestination(e.target.value)} className="h-12 bg-stone-50 border-stone-200" />
-              </div>
-            </div>
-            
-            <Button 
-              onClick={() => requestWithdrawal.mutate()} 
-              disabled={!saqueAmount || !saqueDestination || requestWithdrawal.isPending || Number(saqueAmount) > (bankData?.saldo || 0)} 
-              className="w-full h-12 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-base shadow-sm"
-            >
-              {requestWithdrawal.isPending ? "Processando..." : "Confirmar Transferência"}
-            </Button>
-            
-            {Number(saqueAmount) > (bankData?.saldo || 0) && (
-               <p className="text-xs text-rose-500 font-bold mt-2 text-center">Saldo insuficiente para este saque.</p>
-            )}
+              
+              <Button 
+                type="submit"
+                disabled={!saqueAmount || !saqueDestination || requestWithdrawal.isPending || Number(saqueAmount) > (balanceData?.available_balance || 0) || vaultConfig?.status !== 'configured'} 
+                className="w-full h-12 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-base shadow-sm"
+              >
+                {requestWithdrawal.isPending ? "Processando..." : "Confirmar Transferência"}
+              </Button>
+              
+              {Number(saqueAmount) > (balanceData?.available_balance || 0) && (
+                 <p className="text-xs text-rose-500 font-bold mt-2 text-center">Saldo insuficiente para este saque.</p>
+              )}
+            </form>
           </div>
 
           <div className="bg-white border border-stone-200 rounded-3xl p-6 shadow-sm">
-            <h3 className="font-bold text-stone-800 mb-4 border-b border-stone-100 pb-3">Histórico de Saques e TED</h3>
+            <h3 className="font-bold text-stone-800 mb-4 border-b border-stone-100 pb-3 flex items-center gap-2">
+              <Clock size={18} className="text-stone-400" /> Histórico de Saques e TED
+            </h3>
             <div className="space-y-4">
-              {bankData?.historico?.length === 0 ? <p className="text-sm text-stone-500 italic">Nenhum saque solicitado.</p> : bankData?.historico?.map(s => (
-                <div key={s.withdrawal_id} className="flex justify-between items-center">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-full bg-stone-100 text-stone-600 flex items-center justify-center"><ArrowUpRight size={18}/></div>
+              {withdrawalsHistory.length === 0 ? <p className="text-sm text-stone-500 italic">Nenhum saque solicitado.</p> : withdrawalsHistory.map((s, index) => (
+                <div key={index} className="flex justify-between items-center bg-stone-50 p-4 rounded-2xl border border-stone-100 hover:border-stone-200 transition-colors">
+                  <div className="flex items-center gap-4">
+                    <div className="w-10 h-10 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                      <ArrowUpRight size={20}/>
+                    </div>
                     <div>
-                      <p className="font-bold text-sm text-stone-800">Transferência</p>
-                      <p className="text-xs text-stone-500">{s.status} {s.destination ? `• Chave: ${s.destination}` : ""}</p>
+                      <p className="font-bold text-sm text-stone-800">Transferência PIX</p>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <p className="text-[10px] text-stone-500 font-bold uppercase tracking-wider">{new Date(s.requested_at || s.created_at).toLocaleDateString('pt-BR')}</p>
+                        {s.status === 'PROCESSING' && <span className="bg-amber-100 text-amber-700 text-[9px] px-2 py-0.5 rounded font-bold uppercase tracking-widest">Em Processamento</span>}
+                        {(s.status === 'PAID' || s.status === 'COMPLETED') && <span className="bg-emerald-100 text-emerald-700 text-[9px] px-2 py-0.5 rounded font-bold uppercase tracking-widest">Concluído</span>}
+                      </div>
                     </div>
                   </div>
-                  <div className="font-bold text-rose-600">- {formatCurrency(s.amount)}</div>
+                  <div className="text-right">
+                    <p className="font-bold text-rose-600 text-lg">- {formatCurrency(s.amount)}</p>
+                    <p className="text-[10px] text-stone-400 font-bold uppercase mt-1">Chave: {s.destination || "***"}</p>
+                  </div>
                 </div>
               ))}
+            </div>
+            
+            <div className="mt-6 flex items-center gap-2 text-xs text-stone-400 bg-stone-50 p-3 rounded-lg border border-stone-100">
+              <ShieldCheck size={16} className="text-emerald-500" />
+              As transações são protegidas e auditadas pelo sistema bancário. Saques via PIX geralmente compensam em segundos.
             </div>
           </div>
         </div>

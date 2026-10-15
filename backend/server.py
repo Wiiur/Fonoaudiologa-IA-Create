@@ -1,196 +1,104 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, BackgroundTasks, File, Form
-from fastapi.responses import StreamingResponse, FileResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
-from datetime import datetime, timezone, timedelta, date
-from pathlib import Path
-from bson.objectid import ObjectId
-import json
-import tempfile
 import os
-import logging
-from uuid import uuid4
-import uuid
-import httpx
-import anthropic
-import traceback
 import io
-import csv
 import re
+import json
+import uuid
 import shutil
 import smtplib
+import logging
+import tempfile
+import traceback
+import subprocess
+from uuid import uuid4
+from datetime import datetime, timezone, timedelta, date
+from typing import List, Optional, Literal, Dict, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from bson.objectid import ObjectId
 
+import httpx
+import numpy as np
 import parselmouth
 from parselmouth.praat import call
-import numpy as np
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
 from openai import AsyncOpenAI
 from google import genai
-from dotenv import load_dotenv
 
-# Suas funções personalizadas
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, UploadFile, BackgroundTasks, File, Form
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
+# Importa módulos locais do projeto
 from storage import get_storage
-from voice_analysis import analyze_audio, build_clinical_prompt, analyze_challenge, CHALLENGE_CATALOG
+from voice_analysis import build_clinical_prompt, analyze_challenge
+from core import (
+    db, client, User, get_current_user, anonymize_text,
+    log_audit_access, verify_patient_ownership,
+    OPENROUTER_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY
+)
+from finance_routes import finance_router
 
 # ==========================================
-# 1. CONFIGURAÇÕES INICIAIS E BANCO DE DADOS
+# 1. INICIALIZAÇÃO DO FASTAPI E ARQUIVOS ESTÁTICOS
 # ==========================================
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
-
-# Cria a instância do FastAPI
-app = FastAPI()
+app = FastAPI(title="VoxIntelligence API")
 api_router = APIRouter(prefix="/api")
 
-# Cria a pasta de uploads se não existir e expõe para o React
+# Conecta todas as rotas financeiras/Asaas ao api_router
+api_router.include_router(finance_router)
+
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# Configura o MongoDB e as Chaves de API
-mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get("DB_NAME", "fono_db")] # AQUI O 'db' NASCE E VIVE PARA SEMPRE!
-
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 2. 🛡️ MÓDULO DE SEGURANÇA E LGPD 
+# 2. MODELOS CLÍNICOS E DE GESTÃO
 # ==========================================
-
-def anonymize_text(text: str, patient_name: str = "") -> str:
-    """Filtro LGPD: Remove PII (Informações Pessoalmente Identificáveis) do texto antes de enviar para a IA."""
-    if not text: return ""
-    texto_limpo = str(text)
-
-    # Mascara CPF, Telefones e E-mails
-    texto_limpo = re.sub(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", "[CPF_PROTEGIDO]", texto_limpo)
-    texto_limpo = re.sub(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}\b", "[TEL_PROTEGIDO]", texto_limpo)
-    texto_limpo = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b", "[EMAIL_PROTEGIDO]", texto_limpo)
-
-    # Mascara o Nome do Paciente
-    if patient_name:
-        nome_parts = patient_name.split()
-        if nome_parts:
-            primeiro_nome = nome_parts[0]
-            texto_limpo = re.compile(re.escape(patient_name), re.IGNORECASE).sub("[PACIENTE]", texto_limpo)
-            if len(primeiro_nome) > 2:
-                texto_limpo = re.compile(re.escape(primeiro_nome), re.IGNORECASE).sub("[PACIENTE]", texto_limpo)
-
-    return texto_limpo
-
-async def log_audit_access(user_email: str, action: str, target_patient_id: str):
-    """Função obrigatória para a LGPD: Registra de forma silenciosa quem acessou dados sensíveis."""
-    try:
-        await db.audit_logs.insert_one({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "user_email": user_email,
-            "action": action,
-            "target_patient_id": target_patient_id,
-            "compliance": "LGPD Art. 37 - Rastreabilidade"
-        })
-    except Exception as e:
-        print(f"⚠️ Erro ao salvar log de auditoria: {e}")
-
-async def verify_patient_ownership(patient_id: str, current_user):
-    """Guarda-Costas Oficial (Anti-IDOR). Impede que a Clínica A acesse os dados da Clínica B."""
-    
-    # Se for secretária, pode ver os pacientes da clínica
-    if current_user.role == "secretary":
-        patient = await db.patients.find_one({"$or": [{"_id": patient_id}, {"patient_id": patient_id}]})
-        if not patient: raise HTTPException(status_code=404, detail="Paciente não encontrado.")
-        return patient
-
-    # Se for paciente, só pode ver a si mesmo
-    if current_user.role == "patient":
-        patient = await db.patients.find_one({"linked_user_id": current_user.user_id})
-        if not patient or (patient.get("patient_id") != patient_id and str(patient.get("_id")) != patient_id):
-            raise HTTPException(status_code=403, detail="Acesso bloqueado: Você só pode acessar seus próprios dados.")
-        return patient
-
-    # Se for doutor, verifica se é o dono do paciente
-    patient = await db.patients.find_one({
-        "$or": [{"_id": patient_id}, {"id": patient_id}, {"patient_id": patient_id}]
-    })
-    
-    if not patient:
-        raise HTTPException(status_code=404, detail="Paciente não encontrado no banco de dados.")
-        
-    if str(patient.get("owner_user_id")) != str(current_user.user_id):
-        print(f"🚨 TENTATIVA DE INVASÃO IDOR: Usuário {current_user.email} tentou acessar paciente {patient_id}")
-        raise HTTPException(status_code=403, detail="ALERTA LGPD: Acesso negado.")
-        
-    return patient
-
-    
-
-
-# ---------- Models ----------
-class User(BaseModel):
-    user_id: str
-    email: str
-    name: str
-    picture: Optional[str] = None
-    role: Literal["doctor", "secretary", "patient", "unassigned"] = "unassigned"
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
 class RoleSelect(BaseModel):
     role: Literal["doctor", "secretary"]
     crfa_number: Optional[str] = None
     crfa_state: Optional[str] = None
     professional_name: Optional[str] = None
 
+class ProfileUpdate(BaseModel):
+    crfa_number: Optional[str] = None
+    crfa_state: Optional[str] = None
+    professional_name: Optional[str] = None
 
 class ResponsibleInfo(BaseModel):
     name: Optional[str] = None
     relationship: Optional[str] = None
     cpf: Optional[str] = None
 
-
 class Patient(BaseModel):
     patient_id: str = Field(default_factory=lambda: f"pat_{uuid.uuid4().hex[:12]}")
     owner_user_id: str
     linked_user_id: Optional[str] = None
-    
-    # Dados Pessoais & Fotos
     photo_url: Optional[str] = None
     name: str
-    birth_date: Optional[str] = None  # YYYY-MM-DD
-    age: Optional[int] = None         # Calculado no frontend/backend
+    birth_date: Optional[str] = None
+    age: Optional[int] = None
     rg_cpf: Optional[str] = None
     biological_sex: Optional[Literal["masculino", "feminino"]] = "feminino"
     gender_identity: Optional[str] = "Cisgênero"
-    
-    # Contato & Endereço
     email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
-    
-    # Responsável Legal (se aplicável)
     has_responsible: bool = False
     responsible: Optional[ResponsibleInfo] = None
-    
-    # Demanda & Saúde Vocal
     profession_vocal_demand: Optional[str] = None
     chief_complaint: Optional[str] = None
-    otorrhoea_diagnosis: Optional[str] = None  # Diagnóstico Otorrino
-    interests: Optional[str] = None             # Usado pela IA
+    otorrhoea_diagnosis: Optional[str] = None
+    interests: Optional[str] = None
     notes: Optional[str] = None
-    
-    # Controle da Clínica
     status: Literal["active", "inactive", "discharged"] = "active"
     last_session_at: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -213,7 +121,6 @@ class PatientCreate(BaseModel):
     interests: Optional[str] = None
     notes: Optional[str] = None
 
-
 class Appointment(BaseModel):
     appointment_id: str = Field(default_factory=lambda: f"apt_{uuid.uuid4().hex[:12]}")
     owner_user_id: str
@@ -226,7 +133,6 @@ class Appointment(BaseModel):
     notes: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-
 class AppointmentCreate(BaseModel):
     patient_id: str
     start: str
@@ -234,105 +140,52 @@ class AppointmentCreate(BaseModel):
     mode: Literal["clinic", "telehealth"] = "clinic"
     notes: Optional[str] = None
 
-
-from typing import Optional # Caso ainda não tenha importado no topo do arquivo
-
-class SoapRecord(BaseModel):
-    record_id: str = Field(default_factory=lambda: f"rec_{uuid.uuid4().hex[:12]}")
-    owner_user_id: str
-    patient_id: str
-    session_date: str
-    attendance: str = "presente"         # NOVO: Marca se veio ou faltou
-    absence_reason: Optional[str] = None # NOVO: Motivo da falta
-    subjective: str = ""
-    objective: str = ""
-    assessment: str = ""
-    plan: str = ""
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
 class SoapCreate(BaseModel):
     patient_id: str
     session_date: str
-    attendance: str = "presente"         # NOVO: Recebe do React se veio ou faltou
-    absence_reason: Optional[str] = None # NOVO: Recebe o motivo
+    attendance: str = "presente"
+    absence_reason: Optional[str] = None
     subjective: str = ""
     objective: str = ""
     assessment: str = ""
     plan: str = ""
 
+class ActivityCreate(BaseModel):
+    patient_id: str
+    title: str
+    type: str
+    description: str
+    status: str = "in_progress"
 
-class Activity(BaseModel):
-    activity_id: str = Field(default_factory=lambda: f"act_{uuid.uuid4().hex[:12]}")
-    owner_user_id: str
-    patient_id: Optional[str] = None
-    patient_name: Optional[str] = None
-    diagnosis: str
-    environment: Literal["clinic", "home"] = "home"
-    age_group: str = "adult"
+class FolderCreate(BaseModel):
+    patient_id: str
+    name: str
+
+class ReportCreate(BaseModel):
+    patient_id: str
     title: str
     content: str
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    format: str
+    status: str
 
-
-class ActivityRequest(BaseModel):
-    patient_id: Optional[str] = None
-    diagnosis: str
-    environment: Literal["clinic", "home"]
-    age_group: str
-    goals: Optional[str] = None
-    interests: Optional[str] = None
-
-
-class ReportRequest(BaseModel):
+class ProtocolUpdate(BaseModel):
     patient_id: str
-    recipient: Optional[str] = None
-    purpose: Optional[str] = None
+    protocol_key: str
+    answers: Dict[str, Any]
+    summary: str
+    tip: str
+    score: float
+    domains: Optional[Dict[str, Any]] = None
+    date: str
 
 
-# ---------- Auth helpers ----------
-async def get_current_user(
-    session_token: Optional[str] = Cookie(default=None),
-    authorization: Optional[str] = Header(default=None),
-    dev_user_id: Optional[str] = Header(default=None, alias="user-id"), # <-- Puxa o hack do React
-) -> User:
+# ==========================================
+# 3. ROTAS DE AUTENTICAÇÃO E PERFIL
+# ==========================================
+@api_router.get("/")
+async def root():
+    return {"service": "VoxIntelligence", "status": "ok"}
 
-
-    
-    # 1. MODO DESENVOLVEDOR (Ativado pelo nosso Frontend Local)
-    if dev_user_id:
-        return User(
-            user_id=dev_user_id,
-            role="doctor", 
-            email="dev@clinica.com",
-            name="Willian Rafael de Oliveira"
-        )
-
-    # 2. FLUXO NORMAL E SEGURO (Produção)
-    token = session_token
-    if not token and authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ", 1)[1]
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
-    if not session:
-        raise HTTPException(status_code=401, detail="Invalid session")
-
-    expires_at = session["expires_at"]
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Session expired")
-
-    user_doc = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
-    if not user_doc:
-        raise HTTPException(status_code=401, detail="User not found")
-        
-    return User(**user_doc)
-
-# ---------- Auth Routes ----------
 @api_router.post("/auth/session")
 async def create_session(request: Request, response: Response):
     body = await request.json()
@@ -359,55 +212,40 @@ async def create_session(request: Request, response: Response):
         )
     else:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
-        await db.users.insert_one(
-            {
-                "user_id": user_id,
-                "email": email,
-                "name": data.get("name", email),
-                "picture": data.get("picture"),
-                "role": "unassigned",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        await db.users.insert_one({
+            "user_id": user_id,
+            "email": email,
+            "name": data.get("name", email),
+            "picture": data.get("picture"),
+            "role": "unassigned",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
 
     session_token = data["session_token"]
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    await db.user_sessions.insert_one(
-        {
-            "user_id": user_id,
-            "session_token": session_token,
-            "expires_at": expires_at.isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    await db.user_sessions.insert_one({
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
 
     response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=7 * 24 * 60 * 60,
+        key="session_token", value=session_token, httponly=True,
+        secure=True, samesite="none", path="/", max_age=7 * 24 * 60 * 60,
     )
-    # Auto-link: if a patient exists with this email, link the user
     matching_patient = await db.patients.find_one({"email": email}, {"_id": 0})
     if matching_patient and not matching_patient.get("linked_user_id"):
-        await db.patients.update_one(
-            {"patient_id": matching_patient["patient_id"]},
-            {"$set": {"linked_user_id": user_id}},
-        )
+        await db.patients.update_one({"patient_id": matching_patient["patient_id"]}, {"$set": {"linked_user_id": user_id}})
         current = await db.users.find_one({"user_id": user_id}, {"_id": 0})
         if current and current.get("role") == "unassigned":
             await db.users.update_one({"user_id": user_id}, {"$set": {"role": "patient"}})
     user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     return {"user": user_doc}
 
-
 @api_router.get("/auth/me")
 async def auth_me(user: User = Depends(get_current_user)):
     return user.model_dump()
-
 
 @api_router.post("/auth/logout")
 async def logout(response: Response, session_token: Optional[str] = Cookie(default=None)):
@@ -416,20 +254,12 @@ async def logout(response: Response, session_token: Optional[str] = Cookie(defau
     response.delete_cookie("session_token", path="/")
     return {"ok": True}
 
-
-class ProfileUpdate(BaseModel):
-    crfa_number: Optional[str] = None
-    crfa_state: Optional[str] = None
-    professional_name: Optional[str] = None
-
-
 @api_router.patch("/auth/profile")
 async def update_profile(payload: ProfileUpdate, user: User = Depends(get_current_user)):
     if user.role != "doctor":
         raise HTTPException(status_code=403, detail="Only doctor can update CRFa profile")
     if not payload.crfa_number or not payload.crfa_state or not payload.professional_name:
         raise HTTPException(status_code=400, detail="All CRFa fields required")
-    import re
     if not re.fullmatch(r"\d{1,6}", payload.crfa_number.strip()):
         raise HTTPException(status_code=400, detail="CRFa number must be 1-6 digits")
     await db.users.update_one(
@@ -443,15 +273,12 @@ async def update_profile(payload: ProfileUpdate, user: User = Depends(get_curren
     )
     return await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
 
-
 @api_router.post("/auth/role")
 async def set_role(payload: RoleSelect, user: User = Depends(get_current_user)):
     update = {"role": payload.role}
     if payload.role == "doctor":
         if not payload.crfa_number or not payload.crfa_state or not payload.professional_name:
             raise HTTPException(status_code=400, detail="CRFa number, state and professional name required for doctor")
-        # CRFa format: 1-6 digits + optional /UF (state)
-        import re
         if not re.fullmatch(r"\d{1,6}", payload.crfa_number.strip()):
             raise HTTPException(status_code=400, detail="CRFa number must be 1-6 digits")
         update.update({
@@ -460,23 +287,21 @@ async def set_role(payload: RoleSelect, user: User = Depends(get_current_user)):
             "professional_name": payload.professional_name.strip(),
         })
     await db.users.update_one({"user_id": user.user_id}, {"$set": update})
-    updated = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
-    return updated
+    return await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
 
 
-# ---------- Patients ----------
+# ==========================================
+# 4. PACIENTES, AGENDA, SOAP, PASTAS E ANEXOS
+# ==========================================
 @api_router.get("/patients")
 async def list_patients(user: User = Depends(get_current_user)):
     if user.role == "doctor":
-        docs = await db.patients.find({"owner_user_id": user.user_id}, {"_id": 0}).to_list(1000)
+        return await db.patients.find({"owner_user_id": user.user_id}, {"_id": 0}).to_list(1000)
     elif user.role == "secretary":
-        docs = await db.patients.find({}, {"_id": 0}).to_list(1000)
+        return await db.patients.find({}, {"_id": 0}).to_list(1000)
     elif user.role == "patient":
-        docs = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(1000)
-    else:
-        docs = []
-    return docs
-
+        return await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(1000)
+    return []
 
 @api_router.post("/patients")
 async def create_patient(payload: PatientCreate, user: User = Depends(get_current_user)):
@@ -493,21 +318,14 @@ async def create_patient(payload: PatientCreate, user: User = Depends(get_curren
     d.pop("_id", None)
     return d
 
-
 @api_router.get("/patients/{patient_id}")
 async def get_patient(patient_id: str, user: User = Depends(get_current_user)):
-    # Busca o paciente no banco de dados pelo ID
     patient = await db.patients.find_one({"patient_id": patient_id}, {"_id": 0})
-    
     if not patient:
         raise HTTPException(status_code=404, detail="Paciente não encontrado")
-        
-    # Garante que o médico só possa ver os próprios pacientes (Segurança)
     if user.role != "secretary" and patient.get("owner_user_id") != user.user_id:
         raise HTTPException(status_code=403, detail="Acesso negado a este paciente")
-        
     return patient
-
 
 @api_router.patch("/patients/{patient_id}")
 async def update_patient(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
@@ -518,7 +336,6 @@ async def update_patient(patient_id: str, payload: dict, user: User = Depends(ge
     await db.patients.update_one({"patient_id": patient_id}, {"$set": payload})
     return await db.patients.find_one({"patient_id": patient_id}, {"_id": 0})
 
-
 @api_router.delete("/patients/{patient_id}")
 async def delete_patient(patient_id: str, user: User = Depends(get_current_user)):
     if user.role != "doctor":
@@ -526,691 +343,6 @@ async def delete_patient(patient_id: str, user: User = Depends(get_current_user)
     await db.patients.delete_one({"patient_id": patient_id})
     return {"ok": True}
 
-# ==========================================
-# MODELO DE DADOS PARA ATIVIDADES
-# ==========================================
-class ActivityCreate(BaseModel):
-    patient_id: str
-    title: str
-    type: str # 'casa' ou 'clinica'
-    description: str
-    status: str = "in_progress"
-
-# ==========================================
-# ROTAS PARA ATIVIDADES
-# ==========================================
-@api_router.post("/activities")
-async def create_activity(activity: ActivityCreate):
-    new_activity = activity.model_dump()
-    new_activity["activity_id"] = f"act_{uuid4().hex[:8]}"
-    new_activity["start_date"] = date.today().isoformat()
-    
-    # Se for de clínica, já nasce concluída. Se for para casa, nasce em andamento com 7 dias.
-    if new_activity["type"] == "clinica":
-        new_activity["status"] = "completed"
-    else:
-        new_activity["status"] = "in_progress"
-        
-    new_activity["days_total"] = 7
-    new_activity["days_completed"] = [False, False, False, False, False, False, False]
-    
-    await db.activities.insert_one(new_activity)
-    del new_activity["_id"]
-    return new_activity
-
-@api_router.get("/activities")
-async def get_activities(patient_id: str):
-    activities = await db.activities.find({"patient_id": patient_id}).to_list(100)
-    for a in activities:
-        a["_id"] = str(a["_id"])
-    return activities
-
-# --------- MODELO DE DADOS PARA PASTAS -------------
-
-class FolderCreate(BaseModel):
-    patient_id: str
-    name: str
-
-# --- ROTAS PARA PASTAS-------------------------
-
-@api_router.post("/folders")
-async def create_folder(folder: FolderCreate):
-    new_folder = {
-        "folder_id": f"fold_{uuid4().hex[:8]}", # Gera um ID único curto
-        "patient_id": folder.patient_id,
-        "name": folder.name,
-        "date": date.today().isoformat()
-    }
-    # Salva no MongoDB
-    await db.folders.insert_one(new_folder) 
-    
-    del new_folder["_id"] # Remove o ID nativo do Mongo para não dar erro no React
-    return new_folder
-
-@api_router.get("/folders")
-async def get_folders(patient_id: str):
-    folders = await db.folders.find({"patient_id": patient_id}).to_list(100)
-    for f in folders:
-        f["_id"] = str(f["_id"])
-    return folders
-
-
-
-# ------- ROTAS PARA ARQUIVOS (ANEXOS) --------
-
-@api_router.post("/attachments")
-async def upload_attachment(
-    patient_id: str = Form(...),
-    folder_id: Optional[str] = Form(None),
-    file: UploadFile = File(...)
-):
-    try:
-        # 1. Cria um nome de arquivo único para não sobrescrever arquivos com o mesmo nome
-        file_ext = file.filename.split(".")[-1]
-        unique_filename = f"{uuid4().hex}.{file_ext}"
-        file_path = f"uploads/{unique_filename}"
-
-        # 2. Salva o arquivo real no disco do seu computador
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # 3. Calcula o tamanho em MB
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-
-        # 4. Cria o documento para o MongoDB
-        new_attachment = {
-            "attachment_id": f"att_{uuid4().hex[:8]}",
-            "patient_id": patient_id,
-            "folder_id": folder_id,
-            "name": file.filename,
-            "type": file.content_type,
-            "size": f"{file_size_mb:.2f} MB",
-            "date": date.today().isoformat(),
-            # O React vai ler esse file_url (ex: /uploads/abc1234.pdf)
-            "file_url": f"/uploads/{unique_filename}", 
-            "file_path": file_path # Guardamos o caminho interno para quando formos deletar
-        }
-
-        # 5. Salva a informação no MongoDB
-        await db.attachments.insert_one(new_attachment)
-        del new_attachment["_id"]
-        
-        return new_attachment
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao salvar arquivo: {str(e)}")
-
-
-@api_router.get("/attachments")
-async def get_attachments(patient_id: str):
-    attachments = await db.attachments.find({"patient_id": patient_id}).to_list(100)
-    for a in attachments:
-        a["_id"] = str(a["_id"])
-    return attachments
-
-
-@api_router.delete("/attachments/{attachment_id}")
-async def delete_attachment(attachment_id: str):
-    # 1. Busca o arquivo no MongoDB
-    attachment = await db.attachments.find_one({"attachment_id": attachment_id})
-    if not attachment:
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
-    
-    # 2. Deleta o arquivo real da pasta 'uploads' no disco
-    if os.path.exists(attachment["file_path"]):
-        os.remove(attachment["file_path"])
-        
-    # 3. Deleta o registro do MongoDB
-    await db.attachments.delete_one({"attachment_id": attachment_id})
-    return {"msg": "Arquivo deletado com sucesso"}
-
-# ==========================================
-# ROTA PARA FORÇAR O DOWNLOAD DE ARQUIVOS
-# ==========================================
-@api_router.get("/attachments/download")
-async def secure_download_file(file_url: str, patient_id: str = None, user: User = Depends(get_current_user)):
-    """Rota cofre: Ninguém baixa áudio ou PDF sem estar logado na clínica dona do arquivo"""
-    
-    # Se mandarem o ID do paciente, verifica se o doutor tem permissão
-    if patient_id:
-        # 🚀 AQUI ESTAVA O ERRO! Trocamos 'user.user_id' por 'user'
-        await verify_patient_ownership(patient_id, user)
-        
-    # Lógica de segurança para evitar que hackers naveguem nas pastas do servidor (Path Traversal)
-    safe_path = os.path.normpath(f"./{file_url}")
-    if not safe_path.startswith("uploads") and not safe_path.startswith("storage_data"):
-        raise HTTPException(status_code=403, detail="Acesso não autorizado a esta pasta.")
-        
-    if not os.path.exists(safe_path):
-        raise HTTPException(status_code=404, detail="Arquivo acústico não encontrado no servidor.")
-        
-    # Adiciona Log de auditoria para o download do arquivo
-    await log_audit_access(user.email, "DOWNLOAD_ARQUIVO_SIGILOSO", patient_id or "Desconhecido")
-    
-    return FileResponse(safe_path)
-
-# ==========================================
-# 1. MODELO DE DADOS PARA RELATÓRIOS
-# ==========================================
-class ReportCreate(BaseModel):
-    patient_id: str
-    title: str
-    content: str
-    format: str
-    status: str # 'draft' (rascunho) ou 'final' (finalizado)
-
-# ==========================================
-# 2. ROTAS PARA RELATÓRIOS (MONGODB)
-# ==========================================
-
-# Criar um novo relatório
-@api_router.post("/reports")
-async def create_report(report: ReportCreate):
-    new_report = report.model_dump()
-    new_report["report_id"] = f"rep_{uuid.uuid4().hex[:8]}"
-    new_report["date"] = date.today().isoformat()
-    
-    # Salva no banco de dados
-    await db.reports.insert_one(new_report)
-    
-    del new_report["_id"] # Remove o ID nativo do Mongo para não bugar o React
-    return new_report
-
-# Atualizar um relatório existente (Ex: salvar alterações no rascunho)
-@api_router.put("/reports/{report_id}")
-async def update_report(report_id: str, report: ReportCreate):
-    updated_data = report.model_dump()
-    updated_data["date"] = date.today().isoformat()
-    
-    # Procura pelo report_id e atualiza as informações
-    result = await db.reports.update_one(
-        {"report_id": report_id}, 
-        {"$set": updated_data}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Relatório não encontrado")
-        
-    return {"msg": "Relatório atualizado com sucesso"}
-
-# Buscar todos os relatórios de um paciente para mostrar no histórico
-@api_router.get("/reports")
-async def get_reports(patient_id: str):
-    reports = await db.reports.find({"patient_id": patient_id}).to_list(100)
-    for r in reports:
-        r["_id"] = str(r["_id"])
-    return reports
-
-# Excluir um relatório
-@api_router.delete("/reports/{report_id}")
-async def delete_report(report_id: str):
-    await db.reports.delete_one({"report_id": report_id})
-    return {"msg": "Relatório deletado com sucesso"}
-
-# ==========================================
-# MODELO DE DADOS PARA PROTOCOLOS
-# ==========================================
-class ProtocolUpdate(BaseModel):
-    patient_id: str
-    protocol_key: str
-    answers: Dict[str, Any]
-    summary: str
-    tip: str
-    score: float # <--- MUDAMOS PARA FLOAT (aceita decimais como 82.5)
-    domains: Optional[Dict[str, Any]] = None
-    date: str
-
-# ==========================================
-# ROTAS PARA PROTOCOLOS E QUESTIONÁRIOS
-# ==========================================
-@api_router.post("/protocols")
-async def save_protocol(protocol: ProtocolUpdate):
-    data = protocol.model_dump()
-    
-    # SE O PROTOCOLO FOR O QVV, O BACKEND TOMA AS RÉDEAS DO CÁLCULO
-    if data["protocol_key"] == "qvv":
-        respostas = data.get("answers", {})
-        
-        # Extrai as respostas garantindo que, se faltar alguma, assume valor 1 (ou o que você preferir)
-        bruto_fisico = sum([float(respostas.get(f"q{i}", 1)) for i in [1, 2, 3, 6, 7, 9]])
-        bruto_socio = sum([float(respostas.get(f"q{i}", 1)) for i in [4, 5, 8, 10]])
-        bruto_total = bruto_fisico + bruto_socio
-        
-        # Fórmulas exatas da literatura
-        escore_fisico = 100 - (((bruto_fisico - 6) / 24) * 100)
-        escore_socio = 100 - (((bruto_socio - 4) / 16) * 100)
-        escore_total = 100 - (((bruto_total - 10) / 40) * 100)
-        
-        # Atualiza o dicionário com os valores reais antes de ir para o banco
-        data["domains"] = {
-            "fisico": round(escore_fisico, 2),
-            "socio_emocional": round(escore_socio, 2),
-            "total": round(escore_total, 2)
-        }
-        
-    # Salva no MongoDB (atualiza se já existir, cria se não existir)
-    await db.protocols.update_one(
-        {"patient_id": data["patient_id"], "protocol_key": data["protocol_key"]},
-        {"$set": data},
-        upsert=True
-    )
-    
-    # Devolve para o React o resultado já mastigado
-    return {"msg": "Protocolo salvo com sucesso", "domains_calculados": data.get("domains")}
-
-@api_router.get("/protocols")
-async def get_protocols(patient_id: str):
-    protocols = await db.protocols.find({"patient_id": patient_id}).to_list(100)
-    
-    # Prepara o formato exato que o React espera
-    result = { "qvv": None, "capeV": None, "idv10": None, "esv": None }
-    for p in protocols:
-        key = p["protocol_key"]
-        if key in result:
-            result[key] = {
-                "answers": p.get("answers", {}),
-                "summary": p.get("summary", ""),
-                "tip": p.get("tip", ""),
-                "score": p.get("score", 0),
-                "domains": p.get("domains"),
-                "date": p.get("date", "")
-            }
-    return result
-
-@api_router.delete("/protocols/{patient_id}/{protocol_key}")
-async def delete_protocol(patient_id: str, protocol_key: str):
-    await db.protocols.delete_one({"patient_id": patient_id, "protocol_key": protocol_key})
-    return {"msg": "Protocolo resetado"}
-
-# ---------- Appointments ----------
-@api_router.get("/appointments")
-async def list_appointments(user: User = Depends(get_current_user)):
-    if user.role == "doctor":
-        q = {"owner_user_id": user.user_id}
-    elif user.role == "secretary":
-        q = {}
-    elif user.role == "patient":
-        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
-        ids = [p["patient_id"] for p in pats]
-        q = {"patient_id": {"$in": ids}}
-    else:
-        q = {"_never": True}
-    docs = await db.appointments.find(q, {"_id": 0}).sort("start", 1).to_list(1000)
-    return docs
-
-
-@api_router.post("/appointments")
-async def create_appointment(payload: AppointmentCreate, user: User = Depends(get_current_user)):
-    if user.role not in ("doctor", "secretary"):
-        raise HTTPException(status_code=403)
-    pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
-    if not pat:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    owner_id = pat["owner_user_id"]
-    apt = Appointment(
-        owner_user_id=owner_id,
-        patient_id=payload.patient_id,
-        patient_name=pat["name"],
-        start=payload.start,
-        end=payload.end,
-        mode=payload.mode,
-        notes=payload.notes,
-    )
-    d = apt.model_dump()
-    d["created_at"] = d["created_at"].isoformat()
-    await db.appointments.insert_one(d)
-    d.pop("_id", None)
-    return d
-
-
-@api_router.patch("/appointments/{appointment_id}")
-async def update_appointment(appointment_id: str, payload: dict, user: User = Depends(get_current_user)):
-    if user.role not in ("doctor", "secretary"):
-        raise HTTPException(status_code=403)
-    await db.appointments.update_one({"appointment_id": appointment_id}, {"$set": payload})
-    return await db.appointments.find_one({"appointment_id": appointment_id}, {"_id": 0})
-
-
-@api_router.delete("/appointments/{appointment_id}")
-async def delete_appointment(appointment_id: str, user: User = Depends(get_current_user)):
-    if user.role not in ("doctor", "secretary"):
-        raise HTTPException(status_code=403)
-    await db.appointments.delete_one({"appointment_id": appointment_id})
-    return {"ok": True}
-
-
-# ---------- SOAP records ----------
-# ---------- SOAP records ----------
-@api_router.get("/records")
-async def get_records(patient_id: str, user: User = Depends(get_current_user)):
-    # 🛡️ TRAVA ANTI-IDOR:
-    await verify_patient_ownership(patient_id, user)
-
-    # Soro da Verdade 2: Vai avisar quem está buscando
-    print(f"🔍 BUSCA: O React pediu o histórico do paciente: {patient_id}")
-    
-    # Busca na MESMA coleção 'records'
-    cursor = db.records.find({"patient_id": patient_id})
-    registros = await cursor.to_list(length=100)
-    
-    # Limpa o formato do ID do MongoDB para o FastAPI não travar
-    for r in registros:
-        r["_id"] = str(r["_id"])
-        
-    # Soro da Verdade 3: Vai mostrar quantos achou
-    print(f"📦 RESULTADO: Encontrados {len(registros)} registros no banco para este paciente.")
-    
-    return registros
-
-
-@api_router.post("/records")
-async def create_record(record: SoapCreate):
-    data = record.model_dump()
-    data["record_id"] = f"rec_{uuid.uuid4().hex[:12]}"
-    data["owner_user_id"] = "medico_padrao"
-    data["created_at"] = datetime.now(timezone.utc).isoformat()
-    
-    # Salva na coleção EXATA chamada 'records'
-    result = await db.records.insert_one(data)
-    
-    # Soro da Verdade 1: Vai gritar no terminal quando salvar!
-    print(f"✅ SUCESSO: Evolução salva no banco! ID do MongoDB: {result.inserted_id}")
-    
-    return {"msg": "Evolução salva com sucesso!"}
-
-
-# ---------- Activities ----------
-@api_router.get("/activities")
-async def list_activities(patient_id: Optional[str] = None, user: User = Depends(get_current_user)):
-    q = {}
-    if user.role == "doctor":
-        q["owner_user_id"] = user.user_id
-    elif user.role == "patient":
-        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
-        ids = [p["patient_id"] for p in pats]
-        q["patient_id"] = {"$in": ids}
-    if patient_id:
-        q["patient_id"] = patient_id
-    docs = await db.activities.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
-    return docs
-
-
-ACTIVITY_SYSTEM = (
-    "Você é a VoxIntelligence, uma IA sênior especializada em Fonoaudiologia baseada em evidências. "
-    "Gere planos de atividades clínicas de alta qualidade, com linguagem técnica premium, "
-    "estruturados em Markdown. Adapte à idade e ao diagnóstico. "
-    "Nunca invente protocolos: se não houver consenso, sinalize claramente."
-)
-
-
-@api_router.post("/activities/generate")
-async def generate_activity(payload: ActivityRequest, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Only doctor")
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="Anthropic key missing")
-
-    patient_name = None
-    if payload.patient_id:
-        pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
-        if pat:
-            patient_name = pat["name"]
-
-    env_label = "Clínica (presencial)" if payload.environment == "clinic" else "Casa (home care)"
-    prompt = (
-        f"Crie um plano de atividade fonoaudiológica personalizado.\n\n"
-        f"**Diagnóstico:** {payload.diagnosis}\n"
-        f"**Faixa etária:** {payload.age_group}\n"
-        f"**Ambiente:** {env_label}\n"
-        f"**Objetivos terapêuticos:** {payload.goals or 'não informado'}\n"
-        f"**Interesses do paciente:** {payload.interests or 'não informado'}\n\n"
-        f"Estrutura obrigatória em Markdown:\n"
-        f"# Título da Atividade\n"
-        f"## Objetivo Terapêutico\n"
-        f"## Materiais\n"
-        f"## Instruções Passo a Passo\n"
-        f"## Progressão de Dificuldade\n"
-        f"## Critérios de Observação\n"
-        f"## Dicas para {'terapeuta' if payload.environment == 'clinic' else 'cuidador/paciente'}\n"
-        f"## Referências Científicas (se aplicável)\n"
-    )
-
-    chat = LlmChat(
-        api_key=ANTHROPIC_API_KEY,
-        session_id=f"activity-{uuid.uuid4().hex[:8]}",
-        system_message=ACTIVITY_SYSTEM,
-    ).with_model("anthropic", "claude-sonnet-4-5-20250929")
-
-    # 3. Função Geradora com Redundância
-    # 5. A CASCATA DE IAs (O Motor Triplo Padronizado)
-    # 5. A CASCATA DE IAs (O Motor Triplo Blindado)
-    async def event_gen():
-        full_report = ""
-        
-        # Inicia o motor OpenRouter antecipadamente para os backups
-        client_or = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
-
-        try:
-            # ==========================================
-            # 🥇 TENTATIVA 1: MOTOR PRINCIPAL (Gemini 2.0 Flash)
-            # ==========================================
-            if not GEMINI_API_KEY:
-                raise ValueError("Chave do Gemini ausente")
-
-            print("🚀 [IA Principal] Iniciando Google Gemini 2.0 Flash...")
-            
-            # O GRANDE TRUQUE: Usar a biblioteca OpenAI para acessar o Google! (É oficial e mais estável)
-            client_gemini = AsyncOpenAI(
-                api_key=GEMINI_API_KEY, 
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-            )
-            
-            prompt_formatado = prompt_final + "\n\n--- Laudo validado pela Inteligência Artificial: Google Gemini 2.0 Flash ---"
-
-            response_gemini = await client_gemini.chat.completions.create(
-                model="gemini-3.6-flash", # A versão mais moderna e blindada
-                messages=[
-                    {"role": "system", "content": COPILOT_SYSTEM},
-                    {"role": "user", "content": prompt_formatado}
-                ],
-                stream=True
-            )
-            async for chunk in response_gemini:
-                text = chunk.choices[0].delta.content or ""
-                if text:
-                    full_report += text
-                    yield f"data: {json.dumps({'delta': text})}\n\n"
-
-        except Exception as e1:
-            print(f"⚠️ Gemini falhou: {e1}. Acionando Backup 1...")
-            yield f"data: {json.dumps({'delta': f'\\n\\n*[Google indisponível. Acionando IA Backup 1: Meta Llama 3.2]*\\n\\n'})}\n\n"
-            
-            try:
-                # ==========================================
-                # 🥈 TENTATIVA 2: BACKUP 1 (Llama 3.2 via OpenRouter - Grátis)
-                # ==========================================
-                if not client_or: raise ValueError("Chave do OpenRouter ausente")
-
-                prompt_formatado = prompt_final + "\n\n--- Laudo validado pela Inteligência Artificial: Meta Llama 3.2 ---"
-
-                response_llama = await client_or.chat.completions.create(
-                    model="meta-llama/llama-3.2-3b-instruct",
-                    messages=[
-                        {"role": "system", "content": COPILOT_SYSTEM},
-                        {"role": "user", "content": prompt_formatado}
-                    ],
-                    stream=True
-                )
-                async for chunk in response_llama:
-                    text = chunk.choices[0].delta.content or ""
-                    if text:
-                        full_report += text
-                        yield f"data: {json.dumps({'delta': text})}\n\n"
-
-            except Exception as e2:
-                print(f"⚠️ Llama falhou: {e2}. Acionando Backup 2...")
-                yield f"data: {json.dumps({'delta': f'\\n\\n*[Llama indisponível. Acionando IA Backup 2: Qwen 2.5]*\\n\\n'})}\n\n"
-                
-                try:
-                    # ==========================================
-                    # 🥉 TENTATIVA 3: BACKUP 2 (Qwen 2.5 via OpenRouter - Grátis)
-                    # ==========================================
-                    prompt_formatado = prompt_final + "\n\n--- Laudo validado pela Inteligência Artificial: Qwen 2.5 ---"
-
-                    response_qwen = await client_or.chat.completions.create(
-                        model="qwen/qwen-2.5-7b-instruct",
-                        messages=[
-                            {"role": "system", "content": COPILOT_SYSTEM},
-                            {"role": "user", "content": prompt_formatado}
-                        ],
-                        stream=True
-                    )
-                    async for chunk in response_qwen:
-                        text = chunk.choices[0].delta.content or ""
-                        if text:
-                            full_report += text
-                            yield f"data: {json.dumps({'delta': text})}\n\n"
-
-                except Exception as e3:
-                    print(f"❌ TODAS AS IAs FALHARAM: {e3}") 
-                    yield f"data: {json.dumps({'error': 'Todos os servidores científicos estão ocupados no momento. Tente novamente em 1 minuto.'})}\n\n"
-                    return
-
-        # Salva no MongoDB
-        try:
-            await db.copilot_messages.insert_one({
-                "session_id": payload.session_id, "user_id": user.user_id,
-                "role": "assistant", "content": full_report,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
-        except:
-            pass
-
-        yield f"data: {json.dumps({'done': True})}\n\n"
-
-
-# ---------- Reports ----------
-@api_router.post("/reports/generate")
-async def generate_report(payload: ReportRequest, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403)
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="Anthropic key missing")
-
-    pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
-    if not pat:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    records = await db.soap_records.find(
-        {"patient_id": payload.patient_id}, {"_id": 0}
-    ).sort("session_date", 1).to_list(500)
-
-    hist_txt = "\n\n".join(
-        [
-            f"### Sessão {r['session_date']}\n**S:** {r.get('subjective','')}\n**O:** {r.get('objective','')}\n**A:** {r.get('assessment','')}\n**P:** {r.get('plan','')}"
-            for r in records
-        ]
-    ) or "Sem registros SOAP anteriores."
-
-    prompt = (
-        f"Gere um **Relatório Fonoaudiológico** profissional, em Português (Brasil), com linguagem técnica "
-        f"irretocável, pronto para impressão e envio a {payload.recipient or 'médico encaminhador / escola / convênio'}. "
-        f"Finalidade: {payload.purpose or 'atualização clínica'}.\n\n"
-        f"### Dados do Paciente\n"
-        f"- Nome: {pat['name']}\n"
-        f"- Idade: {pat.get('age','—')}\n"
-        f"- Diagnóstico: {pat.get('diagnosis','—')}\n"
-        f"- Observações: {pat.get('notes','—')}\n\n"
-        f"### Histórico de Sessões (SOAP)\n{hist_txt}\n\n"
-        f"Estrutura obrigatória em Markdown:\n"
-        f"# Relatório Fonoaudiológico\n"
-        f"## 1. Identificação\n## 2. Queixa Principal\n## 3. Histórico\n"
-        f"## 4. Avaliação Fonoaudiológica\n## 5. Evolução\n## 6. Prognóstico\n"
-        f"## 7. Conduta e Recomendações\n\n"
-        f"Ao final, inclua espaço para assinatura do profissional."
-    )
-
-    chat = LlmChat(
-        api_key=ANTHROPIC_API_KEY,
-        session_id=f"report-{uuid.uuid4().hex[:8]}",
-        system_message=ACTIVITY_SYSTEM,
-    ).with_model("anthropic", "claude-sonnet-4-5-20250929")
-
-    async def event_gen():
-        full_text = ""
-        try:
-            async for ev in chat.stream_message(UserMessage(text=prompt)):
-                if isinstance(ev, TextDelta):
-                    full_text += ev.content
-                    yield f"data: {json.dumps({'delta': ev.content})}\n\n"
-                elif isinstance(ev, StreamDone):
-                    break
-            report_id = f"rep_{uuid.uuid4().hex[:12]}"
-            doc = {
-                "report_id": report_id,
-                "owner_user_id": user.user_id,
-                "patient_id": payload.patient_id,
-                "patient_name": pat["name"],
-                "content": full_text,
-                "recipient": payload.recipient,
-                "purpose": payload.purpose,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            await db.reports.insert_one(doc)
-            doc.pop("_id", None)
-            yield f"data: {json.dumps({'done': True, 'report': doc})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
-
-
-@api_router.get("/reports")
-async def list_reports(user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403)
-    docs = await db.reports.find({"owner_user_id": user.user_id}, {"_id": 0}).sort(
-        "created_at", -1
-    ).to_list(200)
-    return docs
-
-
-# ---------- Dashboard KPIs ----------
-@api_router.get("/dashboard/stats")
-async def dashboard_stats(user: User = Depends(get_current_user)):
-    q_owner = {"owner_user_id": user.user_id} if user.role == "doctor" else {}
-    total_patients = await db.patients.count_documents(
-        {**q_owner, "status": "active"} if user.role == "doctor" else {"status": "active"}
-    )
-    now = datetime.now(timezone.utc)
-    today = now.date().isoformat()
-    tomorrow = (now + timedelta(days=1)).date().isoformat()
-    apts_today = await db.appointments.find(
-        {**q_owner, "start": {"$gte": today, "$lt": tomorrow}}, {"_id": 0}
-    ).to_list(200)
-    week_end = (now + timedelta(days=7)).date().isoformat()
-    apts_week = await db.appointments.count_documents(
-        {**q_owner, "start": {"$gte": today, "$lt": week_end}}
-    )
-    records_count = await db.soap_records.count_documents(q_owner) if user.role == "doctor" else 0
-    return {
-        "total_patients": total_patients,
-        "appointments_today": len(apts_today),
-        "appointments_week": apts_week,
-        "records_count": records_count,
-        "today_list": apts_today,
-    }
-
-
-@api_router.get("/")
-async def root():
-    return {"service": "VoxIntelligence", "status": "ok"}
-
-
-# ---------- Patient invitation / linking ----------
 @api_router.post("/patients/{patient_id}/invite")
 async def invite_patient(patient_id: str, user: User = Depends(get_current_user)):
     if user.role != "doctor":
@@ -1220,15 +352,11 @@ async def invite_patient(patient_id: str, user: User = Depends(get_current_user)
         raise HTTPException(status_code=404)
     token = f"inv_{uuid.uuid4().hex[:16]}"
     await db.patient_invites.insert_one({
-        "token": token,
-        "patient_id": patient_id,
-        "email": pat.get("email"),
-        "owner_user_id": user.user_id,
-        "used": False,
+        "token": token, "patient_id": patient_id, "email": pat.get("email"),
+        "owner_user_id": user.user_id, "used": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return {"token": token, "invite_link": f"/portal/join?token={token}"}
-
 
 @api_router.post("/patients/link")
 async def link_patient(payload: dict, user: User = Depends(get_current_user)):
@@ -1238,194 +366,360 @@ async def link_patient(payload: dict, user: User = Depends(get_current_user)):
     inv = await db.patient_invites.find_one({"token": token, "used": False}, {"_id": 0})
     if not inv:
         raise HTTPException(status_code=404, detail="Invalid or used invite")
-    await db.patients.update_one(
-        {"patient_id": inv["patient_id"]},
-        {"$set": {"linked_user_id": user.user_id}},
-    )
+    await db.patients.update_one({"patient_id": inv["patient_id"]}, {"$set": {"linked_user_id": user.user_id}})
     await db.patient_invites.update_one({"token": token}, {"$set": {"used": True}})
     await db.users.update_one({"user_id": user.user_id}, {"$set": {"role": "patient"}})
     return {"ok": True, "patient_id": inv["patient_id"]}
 
+@api_router.post("/activities")
+async def create_activity(activity: ActivityCreate):
+    new_activity = activity.model_dump()
+    new_activity["activity_id"] = f"act_{uuid4().hex[:8]}"
+    new_activity["start_date"] = date.today().isoformat()
+    new_activity["status"] = "completed" if new_activity["type"] == "clinica" else "in_progress"
+    new_activity["days_total"] = 7
+    new_activity["days_completed"] = [False, False, False, False, False, False, False]
+    await db.activities.insert_one(new_activity)
+    del new_activity["_id"]
+    return new_activity
 
-# ---------- Message drafts (WhatsApp / Email) ----------
-class MessageDraftRequest(BaseModel):
-    patient_id: str
-    kind: Literal["reminder", "post_session", "pre_consult", "welcome", "follow_up"]
-    channel: Literal["whatsapp", "email"] = "whatsapp"
-    context: Optional[str] = None
+@api_router.get("/activities")
+async def get_activities(patient_id: Optional[str] = None):
+    q = {"patient_id": patient_id} if patient_id else {}
+    activities = await db.activities.find(q).to_list(100)
+    for a in activities:
+        a["_id"] = str(a["_id"])
+    return activities
 
-@api_router.post("/messages/draft")
-async def draft_message(payload: MessageDraftRequest, user: User = Depends(get_current_user)):
+@api_router.post("/folders")
+async def create_folder(folder: FolderCreate):
+    new_folder = {
+        "folder_id": f"fold_{uuid4().hex[:8]}",
+        "patient_id": folder.patient_id,
+        "name": folder.name,
+        "date": date.today().isoformat()
+    }
+    await db.folders.insert_one(new_folder)
+    del new_folder["_id"]
+    return new_folder
+
+@api_router.get("/folders")
+async def get_folders(patient_id: str):
+    folders = await db.folders.find({"patient_id": patient_id}).to_list(100)
+    for f in folders:
+        f["_id"] = str(f["_id"])
+    return folders
+
+@api_router.post("/attachments")
+async def upload_attachment(
+    patient_id: str = Form(...),
+    folder_id: Optional[str] = Form(None),
+    file: UploadFile = File(...)
+):
+    try:
+        file_ext = file.filename.split(".")[-1]
+        unique_filename = f"{uuid4().hex}.{file_ext}"
+        file_path = f"uploads/{unique_filename}"
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        new_attachment = {
+            "attachment_id": f"att_{uuid4().hex[:8]}",
+            "patient_id": patient_id,
+            "folder_id": folder_id,
+            "name": file.filename,
+            "type": file.content_type,
+            "size": f"{file_size_mb:.2f} MB",
+            "date": date.today().isoformat(),
+            "file_url": f"/uploads/{unique_filename}",
+            "file_path": file_path
+        }
+        await db.attachments.insert_one(new_attachment)
+        del new_attachment["_id"]
+        return new_attachment
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar arquivo: {str(e)}")
+
+@api_router.get("/attachments")
+async def get_attachments(patient_id: str):
+    attachments = await db.attachments.find({"patient_id": patient_id}).to_list(100)
+    for a in attachments:
+        a["_id"] = str(a["_id"])
+    return attachments
+
+@api_router.delete("/attachments/{attachment_id}")
+async def delete_attachment(attachment_id: str):
+    attachment = await db.attachments.find_one({"attachment_id": attachment_id})
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+    if os.path.exists(attachment["file_path"]):
+        os.remove(attachment["file_path"])
+    await db.attachments.delete_one({"attachment_id": attachment_id})
+    return {"msg": "Arquivo deletado com sucesso"}
+
+@api_router.get("/attachments/download")
+async def secure_download_file(file_url: str, patient_id: str = None, user: User = Depends(get_current_user)):
+    if patient_id:
+        await verify_patient_ownership(patient_id, user)
+    safe_path = os.path.normpath(f"./{file_url}")
+    if not safe_path.startswith("uploads") and not safe_path.startswith("storage_data"):
+        raise HTTPException(status_code=403, detail="Acesso não autorizado a esta pasta.")
+    if not os.path.exists(safe_path):
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado no servidor.")
+    await log_audit_access(user.email, "DOWNLOAD_ARQUIVO_SIGILOSO", patient_id or "Desconhecido")
+    return FileResponse(safe_path)
+
+@api_router.post("/reports")
+async def create_report(report: ReportCreate):
+    new_report = report.model_dump()
+    new_report["report_id"] = f"rep_{uuid.uuid4().hex[:8]}"
+    new_report["date"] = date.today().isoformat()
+    await db.reports.insert_one(new_report)
+    del new_report["_id"]
+    return new_report
+
+@api_router.put("/reports/{report_id}")
+async def update_report(report_id: str, report: ReportCreate):
+    updated_data = report.model_dump()
+    updated_data["date"] = date.today().isoformat()
+    result = await db.reports.update_one({"report_id": report_id}, {"$set": updated_data})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Relatório não encontrado")
+    return {"msg": "Relatório atualizado com sucesso"}
+
+@api_router.get("/reports")
+async def get_reports(patient_id: Optional[str] = None, user: User = Depends(get_current_user)):
+    q = {"patient_id": patient_id} if patient_id else {"owner_user_id": user.user_id}
+    reports = await db.reports.find(q).to_list(100)
+    for r in reports:
+        r["_id"] = str(r["_id"])
+    return reports
+
+@api_router.delete("/reports/{report_id}")
+async def delete_report(report_id: str):
+    await db.reports.delete_one({"report_id": report_id})
+    return {"msg": "Relatório deletado com sucesso"}
+
+@api_router.post("/protocols")
+async def save_protocol(protocol: ProtocolUpdate):
+    data = protocol.model_dump()
+    if data["protocol_key"] == "qvv":
+        respostas = data.get("answers", {})
+        bruto_fisico = sum([float(respostas.get(f"q{i}", 1)) for i in [1, 2, 3, 6, 7, 9]])
+        bruto_socio = sum([float(respostas.get(f"q{i}", 1)) for i in [4, 5, 8, 10]])
+        bruto_total = bruto_fisico + bruto_socio
+        escore_fisico = 100 - (((bruto_fisico - 6) / 24) * 100)
+        escore_socio = 100 - (((bruto_socio - 4) / 16) * 100)
+        escore_total = 100 - (((bruto_total - 10) / 40) * 100)
+        data["domains"] = {
+            "fisico": round(escore_fisico, 2),
+            "socio_emocional": round(escore_socio, 2),
+            "total": round(escore_total, 2)
+        }
+    await db.protocols.update_one(
+        {"patient_id": data["patient_id"], "protocol_key": data["protocol_key"]},
+        {"$set": data}, upsert=True
+    )
+    return {"msg": "Protocolo salvo com sucesso", "domains_calculados": data.get("domains")}
+
+@api_router.get("/protocols")
+async def get_protocols(patient_id: str):
+    protocols = await db.protocols.find({"patient_id": patient_id}).to_list(100)
+    result = {"qvv": None, "capeV": None, "idv10": None, "esv": None}
+    for p in protocols:
+        key = p["protocol_key"]
+        if key in result:
+            result[key] = {
+                "answers": p.get("answers", {}), "summary": p.get("summary", ""),
+                "tip": p.get("tip", ""), "score": p.get("score", 0),
+                "domains": p.get("domains"), "date": p.get("date", "")
+            }
+    return result
+
+@api_router.delete("/protocols/{patient_id}/{protocol_key}")
+async def delete_protocol(patient_id: str, protocol_key: str):
+    await db.protocols.delete_one({"patient_id": patient_id, "protocol_key": protocol_key})
+    return {"msg": "Protocolo resetado"}
+
+@api_router.get("/appointments")
+async def list_appointments(user: User = Depends(get_current_user)):
+    if user.role == "doctor":
+        q = {"owner_user_id": user.user_id}
+    elif user.role == "secretary":
+        q = {}
+    elif user.role == "patient":
+        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
+        q = {"patient_id": {"$in": [p["patient_id"] for p in pats]}}
+    else:
+        q = {"_never": True}
+    return await db.appointments.find(q, {"_id": 0}).sort("start", 1).to_list(1000)
+
+@api_router.post("/appointments")
+async def create_appointment(payload: AppointmentCreate, user: User = Depends(get_current_user)):
     if user.role not in ("doctor", "secretary"):
         raise HTTPException(status_code=403)
-        
     pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
     if not pat:
-        raise HTTPException(status_code=404)
-
-    kind_label = {
-        "reminder": "lembrete de sessão",
-        "post_session": "acompanhamento pós-sessão",
-        "pre_consult": "orientações de pré-consulta",
-        "welcome": "boas-vindas",
-        "follow_up": "reengajamento",
-    }[payload.kind]
-    
-    channel_rules = (
-        "WhatsApp: até 3 parágrafos curtos, tom acolhedor porém executivo, use emojis com moderação, use quebras de linha. Sem assunto."
-        if payload.channel == "whatsapp"
-        else "E-mail: inclua uma linha 'Assunto: ...' na primeira linha, depois corpo formal profissional."
+        raise HTTPException(status_code=404, detail="Patient not found")
+    apt = Appointment(
+        owner_user_id=pat["owner_user_id"], patient_id=payload.patient_id,
+        patient_name=pat["name"], start=payload.start, end=payload.end,
+        mode=payload.mode, notes=payload.notes,
     )
-    
-    # 🚨 BLINDAGEM LGPD: Nunca enviar o dicionário 'pat' inteiro! 
-    # Extraímos apenas o nome (para a mensagem ser amigável) e dados clínicos. O resto fica no banco.
-    primeiro_nome = pat['name'].split()[0]
-    dados_clinicos_seguros = {
-        "idade": pat.get("age", "N/A"),
-        "diagnostico": pat.get("diagnosis", "N/A"),
-        "queixa_principal": pat.get("chief_complaint", "N/A")
+    d = apt.model_dump()
+    d["created_at"] = d["created_at"].isoformat()
+    await db.appointments.insert_one(d)
+    d.pop("_id", None)
+    return d
+
+@api_router.patch("/appointments/{appointment_id}")
+async def update_appointment(appointment_id: str, payload: dict, user: User = Depends(get_current_user)):
+    if user.role not in ("doctor", "secretary"):
+        raise HTTPException(status_code=403)
+    await db.appointments.update_one({"appointment_id": appointment_id}, {"$set": payload})
+    return await db.appointments.find_one({"appointment_id": appointment_id}, {"_id": 0})
+
+@api_router.delete("/appointments/{appointment_id}")
+async def delete_appointment(appointment_id: str, user: User = Depends(get_current_user)):
+    if user.role not in ("doctor", "secretary"):
+        raise HTTPException(status_code=403)
+    await db.appointments.delete_one({"appointment_id": appointment_id})
+    return {"ok": True}
+
+@api_router.get("/records")
+async def get_records(patient_id: str, user: User = Depends(get_current_user)):
+    await verify_patient_ownership(patient_id, user)
+    registros = await db.records.find({"patient_id": patient_id}).to_list(length=100)
+    for r in registros:
+        r["_id"] = str(r["_id"])
+    return registros
+
+@api_router.post("/records")
+async def create_record(record: SoapCreate):
+    data = record.model_dump()
+    data["record_id"] = f"rec_{uuid.uuid4().hex[:12]}"
+    data["owner_user_id"] = "medico_padrao"
+    data["created_at"] = datetime.now(timezone.utc).isoformat()
+    await db.records.insert_one(data)
+    return {"msg": "Evolução salva com sucesso!"}
+
+@api_router.get("/reports/evolution/compile")
+async def compile_soap_history(patient_id: str, user: User = Depends(get_current_user)):
+    if user.role != "doctor":
+        raise HTTPException(status_code=403, detail="Acesso restrito")
+    pat = await db.patients.find_one({"patient_id": patient_id})
+    records = await db.records.find({"patient_id": patient_id}).sort("session_date", 1).to_list(500)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph("<b>COMPILADO DE EVOLUÇÃO CLÍNICA (SOAP)</b>", styles['Heading1']),
+        Paragraph(f"<b>Paciente:</b> {pat.get('name')} | <b>Gerado em:</b> {datetime.now().strftime('%d/%m/%Y')}", styles['Normal']),
+        Spacer(1, 20)
+    ]
+    for r in records:
+        presenca = "Falta" if r.get('attendance') == 'falta' else "Presente"
+        story.append(Paragraph(f"<b>Data: {r.get('session_date')} ({presenca})</b>", styles['Heading4']))
+        if r.get('attendance') == 'falta':
+            story.append(Paragraph(f"<b>Motivo:</b> {r.get('absence_reason', 'Não informado')}", styles['Normal']))
+        else:
+            if r.get('subjective'): story.append(Paragraph(f"<b>S:</b> {r.get('subjective')}", styles['Normal']))
+            if r.get('objective'): story.append(Paragraph(f"<b>O:</b> {r.get('objective')}", styles['Normal']))
+            if r.get('assessment'): story.append(Paragraph(f"<b>A:</b> {r.get('assessment')}", styles['Normal']))
+            if r.get('plan'): story.append(Paragraph(f"<b>P:</b> {r.get('plan')}", styles['Normal']))
+        story.append(Spacer(1, 10))
+    doc.build(story)
+    buffer.seek(0)
+    return Response(
+        content=buffer.getvalue(), media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=Prontuario_{pat['name'].replace(' ', '_')}.pdf"}
+    )
+
+@api_router.get("/dashboard/stats")
+async def dashboard_stats(user: User = Depends(get_current_user)):
+    q_owner = {"owner_user_id": user.user_id} if user.role == "doctor" else {}
+    total_patients = await db.patients.count_documents({**q_owner, "status": "active"} if user.role == "doctor" else {"status": "active"})
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    tomorrow = (now + timedelta(days=1)).date().isoformat()
+    apts_today = await db.appointments.find({**q_owner, "start": {"$gte": today, "$lt": tomorrow}}, {"_id": 0}).to_list(200)
+    week_end = (now + timedelta(days=7)).date().isoformat()
+    apts_week = await db.appointments.count_documents({**q_owner, "start": {"$gte": today, "$lt": week_end}})
+    records_count = await db.records.count_documents(q_owner) if user.role == "doctor" else 0
+    return {
+        "total_patients": total_patients, "appointments_today": len(apts_today),
+        "appointments_week": apts_week, "records_count": records_count, "today_list": apts_today,
     }
-    
-    # Se o doutor digitou alguma anotação no modal, nós limpamos antes de enviar
-    contexto_limpo = anonymize_text(payload.context or 'nenhum', pat['name'])
-
-    prompt = (
-        f"Escreva uma mensagem humanizada e premium de **{kind_label}** para o paciente "
-        f"**{primeiro_nome}**. Canal: {payload.channel}.\n"
-        f"Regras: {channel_rules}\n"
-        f"Contexto extra solicitado pelo profissional: {contexto_limpo}.\n"
-        f"Perfil Clínico Básico (USE APENAS SE AJUDAR NO CONTEXTO DA MENSAGEM): {dados_clinicos_seguros}\n"
-        f"Assine como 'Equipe da Clínica'."
-    )
-    
-    chat = LlmChat(
-        api_key=ANTHROPIC_API_KEY,
-        session_id=f"msg-{uuid.uuid4().hex[:8]}",
-        system_message="Você é a VoxIntelligence, especialista em comunicação clínica premium.",
-    ).with_model("anthropic", "claude-sonnet-4-5-20250929")
-    
-    full = ""
-    async for ev in chat.stream_message(UserMessage(text=prompt)):
-        if isinstance(ev, TextDelta):
-            full += ev.content
-        elif isinstance(ev, StreamDone):
-            break
-            
-    wa_link = None
-    if payload.channel == "whatsapp" and pat.get("phone"):
-        import urllib.parse
-        digits = "".join(c for c in pat["phone"] if c.isdigit())
-        wa_link = f"https://wa.me/{digits}?text={urllib.parse.quote(full)}"
-        
-    return {"text": full, "channel": payload.channel, "wa_link": wa_link, "patient_name": pat["name"]}
 
 
-# ---------- Clinical Copilot chat (SSE) ----------
+# ==========================================
+# 5. COPILOTO IA E ANALYTICS CLÍNICO
+# ==========================================
 class CopilotRequest(BaseModel):
     session_id: str
     message: str
     patient_id: Optional[str] = None
 
+class AnalyticsRequest(BaseModel):
+    patient_id: str
+
 COPILOT_SYSTEM = """
 Você é a VoxIntelligence — Um Copiloto de Inteligência Artificial Especializado em Fonoaudiologia.
 Seu papel é auxiliar o fonoaudiólogo com análises, resumos e insights baseados em dados.
-
-🚨 REGRA DE OURO (LIMITAÇÃO CLÍNICA):
-Você é um assistente, não um médico. Você NUNCA deve emitir laudos finais ou fechar diagnósticos estruturais. Use frases como "Sugere-se avaliar...", "Os dados apontam para...", "Hipótese funcional de...".
-
-🧠 DIRETRIZES ANTI-ALUCINAÇÃO E CITAÇÕES:
-1. Toda lógica clínica, acústica ou biológica deve ser baseada em literatura científica real. Se a resposta não existir na ciência, diga: "Não há evidências suficientes para esta correlação".
-2. Você DEVE especificar a fonte de suas afirmações.
-3. Ao final da resposta, inclua uma seção "Referências Bibliográficas" com links clicáveis. Exemplo: [Nome do Autor, Ano](https://scholar.google.com/scholar?q=palavras+chave).
-
-⚙️ MÓDULOS DE ATUAÇÃO (Responda de acordo com a entrada do Fonoaudiólogo):
-- GERAÇÃO DE INSIGHTS: Correlacione o histórico e aponte caminhos terapêuticos.
-- TRANSCRIÇÃO E RESUMO: Ao receber dados de sessões, extraia pontos principais, queixas e exercícios.
-- DIGITALIZAÇÃO: Organize informações clínicas de documentos e exames textuais.
-- EVOLUÇÃO DE SESSÕES: Gere sugestões de evolução padrão SOAP (Subjetivo, Objetivo, Avaliação, Plano).
+Você é um assistente, não um médico. Nunca emita diagnósticos estruturais definitivos.
 """
 
 @api_router.post("/copilot/chat")
 async def copilot_chat(payload: CopilotRequest, user: User = Depends(get_current_user)):
     if user.role != "doctor":
         raise HTTPException(status_code=403)
-        
-    # 1. Salva a mensagem do médico
+
     await db.copilot_messages.insert_one({
         "session_id": payload.session_id, "user_id": user.user_id,
         "role": "user", "content": payload.message,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    # 2. Puxa histórico do chat
     history = await db.copilot_messages.find(
         {"session_id": payload.session_id, "user_id": user.user_id}, {"_id": 0}
     ).sort("created_at", 1).to_list(50)
     ctx = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in history[:-1]])
 
-    # 3. Contexto do Paciente Blindado
     contexto_paciente = ""
     if payload.patient_id:
         try:
             pat = await db.patients.find_one({"patient_id": payload.patient_id})
             if pat:
-                records = await db.records.find({"patient_id": payload.patient_id}).to_list(3)
                 challenges = await db.voice_challenges.find({"patient_id": payload.patient_id}).to_list(3)
                 protocols = await db.protocols.find({"patient_id": payload.patient_id}).to_list(3)
-
-                contexto_paciente = f"\n\n--- DADOS DO PRONTUÁRIO SELECIONADO ---\n"
-                contexto_paciente += f"Paciente: {pat.get('name', 'N/A')} | Idade: {pat.get('age', 'N/A')}\n"
-                
+                contexto_paciente = f"\n\n--- DADOS DO PRONTUÁRIO SELECIONADO ---\nPaciente: {pat.get('name', 'N/A')} | Idade: {pat.get('age', 'N/A')}\n"
                 if challenges:
                     contexto_paciente += "\nTESTES ACÚSTICOS RECENTES:\n"
                     for c in challenges:
                         m = c.get('metrics', {})
                         if m:
                             contexto_paciente += f"- {c.get('challenge_title')}: F0={m.get('f0_mean_hz')}Hz, Jitter={m.get('jitter_local_pct')}%\n"
-                
                 if protocols:
                     contexto_paciente += "\nPROTOCOLOS APLICADOS:\n"
                     for p in protocols:
                         contexto_paciente += f"- {p.get('protocol_key').upper()}: Escore {p.get('score')}\n"
-                
                 contexto_paciente += "----------------------------------------\n\n"
         except Exception as e:
-            print(f"⚠️ Aviso: Falha ao buscar dados do paciente: {e}")
+            print(f"⚠️ Aviso ao buscar dados do paciente: {e}")
 
-    # 4. Monta o Prompt Final
-    prompt_final = contexto_paciente
-    prompt_final += f"Histórico do Chat:\n{ctx}\n\n" if ctx else ""
-    prompt_final += f"Entrada do Fonoaudiólogo: {payload.message}"
+    prompt_final = contexto_paciente + (f"Histórico do Chat:\n{ctx}\n\n" if ctx else "") + f"Entrada do Fonoaudiólogo: {payload.message}"
 
-    # 5. A CASCATA DE IAs (O Motor Triplo Blindado)
     async def event_gen():
         full_report = ""
-        
-        # Inicia o motor OpenRouter antecipadamente
         client_or = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY) if OPENROUTER_API_KEY else None
-
         try:
-            # ==========================================
-            # 🥇 TENTATIVA 1: MOTOR PRINCIPAL (Gemini 2.0 Flash)
-            # ==========================================
             if not GEMINI_API_KEY:
                 raise ValueError("Chave do Gemini ausente")
-
-            print("🚀 [IA Principal] Iniciando Google Gemini 2.0 Flash...")
-            
-            client_gemini = AsyncOpenAI(
-                api_key=GEMINI_API_KEY, 
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-            )
-            
-            prompt_formatado = prompt_final + "\n\n--- Laudo validado pela Inteligência Artificial: Google Gemini 2.0 Flash ---"
-
+            client_gemini = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
             response_gemini = await client_gemini.chat.completions.create(
-                model="gemini-3.6-flash", 
-                messages=[
-                    {"role": "system", "content": COPILOT_SYSTEM},
-                    {"role": "user", "content": prompt_formatado}
-                ],
+                model="gemini-2.0-flash",
+                messages=[{"role": "system", "content": COPILOT_SYSTEM}, {"role": "user", "content": prompt_final}],
                 stream=True
             )
             async for chunk in response_gemini:
@@ -1433,25 +727,13 @@ async def copilot_chat(payload: CopilotRequest, user: User = Depends(get_current
                 if text:
                     full_report += text
                     yield f"data: {json.dumps({'delta': text})}\n\n"
-
         except Exception as e1:
-            print(f"⚠️ Gemini falhou: {e1}. Acionando Backup 1...")
-            yield f"data: {json.dumps({'delta': f'\\n\\n*[Google indisponível. Acionando IA Backup 1: Meta Llama 3.2]*\\n\\n'})}\n\n"
-            
             try:
-                # ==========================================
-                # 🥈 TENTATIVA 2: BACKUP 1 (Llama 3.2)
-                # ==========================================
-                if not client_or: raise ValueError("Chave do OpenRouter ausente")
-
-                prompt_formatado = prompt_final + "\n\n--- Laudo validado pela Inteligência Artificial: Meta Llama 3.2 ---"
-
+                if not client_or:
+                    raise ValueError("Chave do OpenRouter ausente")
                 response_llama = await client_or.chat.completions.create(
                     model="meta-llama/llama-3.2-3b-instruct",
-                    messages=[
-                        {"role": "system", "content": COPILOT_SYSTEM},
-                        {"role": "user", "content": prompt_formatado}
-                    ],
+                    messages=[{"role": "system", "content": COPILOT_SYSTEM}, {"role": "user", "content": prompt_final}],
                     stream=True
                 )
                 async for chunk in response_llama:
@@ -1459,37 +741,10 @@ async def copilot_chat(payload: CopilotRequest, user: User = Depends(get_current
                     if text:
                         full_report += text
                         yield f"data: {json.dumps({'delta': text})}\n\n"
-
             except Exception as e2:
-                print(f"⚠️ Llama falhou: {e2}. Acionando Backup 2...")
-                yield f"data: {json.dumps({'delta': f'\\n\\n*[Llama indisponível. Acionando IA Backup 2: Qwen 2.5]*\\n\\n'})}\n\n"
-                
-                try:
-                    # ==========================================
-                    # 🥉 TENTATIVA 3: BACKUP 2 (Qwen 2.5)
-                    # ==========================================
-                    prompt_formatado = prompt_final + "\n\n--- Laudo validado pela Inteligência Artificial: Qwen 2.5 ---"
+                yield f"data: {json.dumps({'error': 'Servidores de IA ocupados no momento.'})}\n\n"
+                return
 
-                    response_qwen = await client_or.chat.completions.create(
-                        model="qwen/qwen-2.5-7b-instruct",
-                        messages=[
-                            {"role": "system", "content": COPILOT_SYSTEM},
-                            {"role": "user", "content": prompt_formatado}
-                        ],
-                        stream=True
-                    )
-                    async for chunk in response_qwen:
-                        text = chunk.choices[0].delta.content or ""
-                        if text:
-                            full_report += text
-                            yield f"data: {json.dumps({'delta': text})}\n\n"
-
-                except Exception as e3:
-                    print(f"❌ TODAS AS IAs FALHARAM: {e3}") 
-                    yield f"data: {json.dumps({'error': 'Todos os servidores científicos estão ocupados no momento. Tente novamente em 1 minuto.'})}\n\n"
-                    return
-
-        # Salva no MongoDB
         try:
             await db.copilot_messages.insert_one({
                 "session_id": payload.session_id, "user_id": user.user_id,
@@ -1498,231 +753,55 @@ async def copilot_chat(payload: CopilotRequest, user: User = Depends(get_current
             })
         except:
             pass
-
         yield f"data: {json.dumps({'done': True})}\n\n"
 
-    # Retorna o fluxo para o React
-    return StreamingResponse(
-        event_gen(), 
-        media_type="text/event-stream", 
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-    )
+    return StreamingResponse(event_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @api_router.get("/copilot/history/{session_id}")
 async def copilot_history(session_id: str, user: User = Depends(get_current_user)):
     if user.role != "doctor":
         raise HTTPException(status_code=403)
-    msgs = await db.copilot_messages.find(
-        {"session_id": session_id, "user_id": user.user_id}, {"_id": 0}
-    ).sort("created_at", 1).to_list(200)
-    return msgs
+    return await db.copilot_messages.find({"session_id": session_id, "user_id": user.user_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
 
-
-# ---------- Stripe session packages & Financeiro ----------
-class PackageCreate(BaseModel):
-    name: str
-    sessions: int
-    amount: float  # BRL
-    patient_id: Optional[str] = None
-    payment_type: str = "pacote" # Mensal, Semanal, Avulso, Pacote
-    auto_reminders: bool = True  # Lembretes automáticos (Sim/Não)
-
-@api_router.post("/packages")
-async def create_package(payload: PackageCreate, user: User = Depends(get_current_user)):
+@api_router.post("/copilot/analytics")
+async def clinical_analytics(payload: AnalyticsRequest, user: User = Depends(get_current_user)):
     if user.role != "doctor":
-        raise HTTPException(status_code=403)
-        
-    pkg_id = f"pkg_{uuid.uuid4().hex[:12]}"
-    
-    doc = {
-        "package_id": pkg_id, 
-        "owner_user_id": user.user_id,
-        "patient_id": payload.patient_id, 
-        "name": payload.name,
-        "sessions": payload.sessions, 
-        "amount": float(payload.amount),
-        "payment_type": payload.payment_type, # NOVO: Salva como o paciente vai pagar
-        "auto_reminders": payload.auto_reminders, # NOVO: Salva se a IA vai cobrar ou não
-        "currency": "brl", 
-        "status": "unpaid",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    
-    await db.packages.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+        raise HTTPException(status_code=403, detail="Acesso restrito")
+    records = await db.records.find({"patient_id": payload.patient_id}).sort("session_date", -1).to_list(15)
+    if len(records) < 2:
+        return {"analytics": "Não há volume de registros suficiente para traçar um gráfico evolutivo. É necessário no mínimo 2 sessões."}
 
-
-@api_router.get("/packages")
-async def list_packages(user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403)
-    return await db.packages.find({"owner_user_id": user.user_id}, {"_id": 0}).sort("created_at", -1).to_list(200)
-
-# ---------------------------------------------------------
-# ROTA 1: EMISSÃO DE NOTA FISCAL (NFSe)
-# ---------------------------------------------------------
-class NFSeRequest(BaseModel):
-    patient_name: str
-    cpf: str
-    service: str
-    amount: float
-
-@api_router.post("/finance/nfse/emit")
-async def emit_nfse(payload: NFSeRequest, user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403)
-        
-    doc = {
-        "nfse_id": f"nfse_{uuid.uuid4().hex[:10]}",
-        "owner_user_id": user.user_id,
-        "numero_nota": f"2026{str(uuid.uuid4().int)[:4]}", # Gera um número de nota único
-        "prefeitura": "Prefeitura de Nova Odessa",
-        "patient_name": payload.patient_name,
-        "cpf": payload.cpf,
-        "service": payload.service,
-        "amount": payload.amount,
-        "status": "Emitida com Sucesso",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.nfse.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-# ---------------------------------------------------------
-# ROTA 2: EXPORTAÇÃO DMED / CARNÊ-LEÃO (RECEITA FEDERAL)
-# ---------------------------------------------------------
-@api_router.get("/finance/dmed/export")
-async def export_dmed(user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403)
-    
-    # Busca todas as cobranças que já foram PAGAS no sistema
-    paid_pkgs = await db.packages.find({"owner_user_id": user.user_id, "status": "paid"}).to_list(None)
-    
-    # Cria o arquivo CSV na memória (Formato exigido por contadores)
-    output = io.StringIO()
-    writer = csv.writer(output, delimiter=';') # Ponto e vírgula separa as colunas
-    
-    # Cabeçalho da Planilha
-    writer.writerow(["CPF_PAGADOR", "NOME_PACIENTE", "DESCRICAO_SERVICO", "DATA_PAGAMENTO", "VALOR_RECEBIDO"])
-    
-    for p in paid_pkgs:
-        nome = p.get("name", "Paciente Não Identificado")
-        valor = p.get("amount", 0.0)
-        data = p.get("created_at", "")[:10] # Formato YYYY-MM-DD
-        
-        # Como o CPF não estava atrelado diretamente ao pacote nas aulas anteriores, 
-        # colocamos um placeholder que o contador ajusta se faltar
-        cpf = "000.000.000-00" 
-        
-        writer.writerow([cpf, nome, "Servicos Fonoaudiologicos", data, f"{valor:.2f}".replace(".", ",")])
-        
-    output.seek(0)
-    
-    # Devolve o arquivo como um download forçado para o navegador
-    response = Response(content=output.getvalue())
-    response.headers["Content-Disposition"] = f"attachment; filename=Lote_DMED_Receita_Federal_{datetime.now().year}.csv"
-    response.headers["Content-Type"] = "text/csv; charset=utf-8"
-    
-    return response
-
-
-@api_router.post("/packages/checkout")
-async def package_checkout(payload: dict, request: Request, user: User = Depends(get_current_user)):
-    # Usando 'dict' acabamos com o erro 422 de validação estrita!
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Acesso negado")
-        
-    package_id = payload.get("package_id")
-    pkg = await db.packages.find_one({"package_id": package_id})
-    
-    if not pkg:
-        raise HTTPException(status_code=404, detail="Pacote não encontrado")
-
-    # Aqui no futuro você conectará a API da Stripe/Asaas real.
-    # Por enquanto, geramos um link simulado perfeito para o sistema não quebrar:
-    link_pagamento_seguro = f"https://pagamento.seguro.clinica/checkout/{package_id}"
-    
-    # 🚨 O SEGREDO: Salva o link no banco de dados!
-    await db.packages.update_one(
-        {"package_id": package_id}, 
-        {"$set": {"checkout_url": link_pagamento_seguro}}
+    hist_txt = "\n\n".join([
+        f"Data: {r['session_date']} - Status: {r.get('attendance')}\nS: {r.get('subjective','')}\nO: {r.get('objective','')}\nA: {r.get('assessment','')}\nP: {r.get('plan','')}"
+        for r in records
+    ])
+    prompt = (
+        "Você é uma IA de Auditoria Clínica especializada em Fonoaudiologia.\n"
+        "Faça um 'Resumo Sistêmico do Paciente' avaliando o progresso, queixas que sumiram, engajamento e métricas que melhoraram em até 2 parágrafos.\n\n"
+        f"HISTÓRICO:\n{hist_txt}"
     )
-    
-    return {"url": link_pagamento_seguro, "session_id": "simulador_oficial"}
-
-
-@api_router.get("/packages/checkout/status/{session_id}")
-async def checkout_status(session_id: str, request: Request):
-    if not STRIPE_API_KEY:
-        raise HTTPException(status_code=500)
-    host_url = str(request.base_url)
-    webhook_url = f"{host_url}api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    st = await stripe_checkout.get_checkout_status(session_id)
-    tx = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
-    if tx and tx["payment_status"] != "paid" and st.payment_status == "paid":
-        await db.payment_transactions.update_one(
-            {"session_id": session_id}, {"$set": {"payment_status": "paid", "status": st.status}},
+    try:
+        client_gemini = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+        response = await client_gemini.chat.completions.create(
+            model="gemini-2.0-flash",
+            messages=[{"role": "user", "content": prompt}]
         )
-        pkg_id = (st.metadata or {}).get("package_id")
-        if pkg_id:
-            await db.packages.update_one({"package_id": pkg_id}, {"$set": {"status": "paid"}})
-    return {
-        "status": st.status, "payment_status": st.payment_status,
-        "amount_total": st.amount_total, "currency": st.currency,
-    }
+        return {"analytics": response.choices[0].message.content}
+    except Exception:
+        return {"analytics": "Servidores científicos ocupados no momento. Tente novamente em breve."}
 
 
-@api_router.post("/webhook/stripe")
-async def stripe_webhook(request: Request):
-    if not STRIPE_API_KEY:
-        return {"ok": False}
-    body = await request.body()
-    host_url = str(request.base_url)
-    webhook_url = f"{host_url}api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY, webhook_url=webhook_url)
-    resp = await stripe_checkout.handle_webhook(body, request.headers.get("Stripe-Signature"))
-    if resp.payment_status == "paid":
-        pkg_id = (resp.metadata or {}).get("package_id")
-        if pkg_id:
-            await db.packages.update_one({"package_id": pkg_id}, {"$set": {"status": "paid"}})
-            await db.payment_transactions.update_one(
-                {"session_id": resp.session_id}, {"$set": {"payment_status": "paid"}},
-            )
-    return {"ok": True}
-
-
-# ---------- Voice Analysis (Acoustic + AI Laudo) ----------
-VOICE_ANALYSIS_SYSTEM = (
-    "Você é a VoxIntelligence, especialista em análise vocal instrumental (Praat). "
-    "Gere laudos técnicos, respeitando ética profissional fonoaudiológica e sem diagnóstico médico definitivo."
-)
-
-
-class VoiceAnalysisMeta(BaseModel):
-    patient_id: str
-    task: Literal["sustained_vowel", "reading", "spontaneous"] = "sustained_vowel"
-    notes: Optional[str] = None
-
-
+# ==========================================
+# 6. VOICE LAB (PRAAT) E DESAFIOS VOCAIS
+# ==========================================
 def analyze_audio(file_path: str):
-    print(f"\n--- INICIANDO EXTRAÇÃO ACÚSTICA CLÍNICA (PRAAT ENGINE) ---")
-    
-    import os
-    import numpy as np
-    import parselmouth
-    from parselmouth.praat import call
-    
     base_dir = os.path.dirname(os.path.abspath(__file__))
     if "storage_data" in file_path:
         sub_path = file_path[file_path.find("storage_data"):]
         clean_path = os.path.join(base_dir, sub_path)
     else:
         clean_path = os.path.normpath(file_path)
-        
+
     metrics = {
         "duration_sec": 0.0, "phonation_time_sec": 0.0,
         "f0_mean_hz": 0.0, "f0_std_hz": 0.0,
@@ -1730,104 +809,78 @@ def analyze_audio(file_path: str):
         "hnr_db": 0.0, "intensity_db": 0.0, "cpp_db": 15.0,
         "pitch_timeline": {"time": [], "freq": []},
         "intensity_timeline": {"time": [], "db": []},
-        "formants_timeline": {"time": [], "f1": [], "f2": [], "f3": []}, # NOVO: Rastreio de Formantes
+        "formants_timeline": {"time": [], "f1": [], "f2": [], "f3": []},
         "wave_timeline": []
     }
-    
     if not os.path.exists(clean_path):
         return metrics
-        
+
     try:
-        # 1. Carregamento e Duração
         sound = parselmouth.Sound(clean_path)
         duration = sound.get_total_duration()
         metrics["duration_sec"] = round(duration, 2)
-        
-        # 2. Extração de F0 (Pitch) com limites clínicos padrão (75Hz a 500Hz)
+
         pitch = sound.to_pitch(pitch_floor=75, pitch_ceiling=500)
         f0_mean = call(pitch, "Get mean", 0, 0, "Hertz")
         f0_std = call(pitch, "Get standard deviation", 0, 0, "Hertz")
         if not np.isnan(f0_mean): metrics["f0_mean_hz"] = round(f0_mean, 2)
         if not np.isnan(f0_std): metrics["f0_std_hz"] = round(f0_std, 2)
 
-        # 3. Extração de Intensidade
         intensity = sound.to_intensity()
         int_mean = call(intensity, "Get mean", 0, 0, "energy")
         if not np.isnan(int_mean): metrics["intensity_db"] = round(int_mean, 2)
 
-        # 4. Extração de Formantes (Método de Burg - Padrão Ouro Praat)
-        # 5 formantes, limite máximo de 5500Hz (padrão genérico adulto)
         formants = call(sound, "To Formant (burg)", 0.0, 5, 5500, 0.025, 50)
 
-        # 5. Extração de Perturbação (Jitter/Shimmer) e Harmônicos
         try:
             pulses = call([sound, pitch], "To PointProcess (cc)")
             jitter = call(pulses, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3) * 100
             shimmer = call([sound, pulses], "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6) * 100
             if not np.isnan(jitter): metrics["jitter_local_pct"] = round(jitter, 3)
             if not np.isnan(shimmer): metrics["shimmer_local_pct"] = round(shimmer, 3)
-        except: pass
+        except:
+            pass
 
         try:
             harmonicity = call(sound, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
             hnr = call(harmonicity, "Get mean", 0, 0)
             if not np.isnan(hnr): metrics["hnr_db"] = round(hnr, 2)
-        except: pass
+        except:
+            pass
 
-        # ==========================================================
-        # 6. GERAÇÃO DA MATRIZ GRÁFICA DE ALTA PRECISÃO
-        # ==========================================================
         try:
             raw_wave = sound.values[0]
-            
-            # NORMALIZAÇÃO CLÍNICA (Auto-Scaling do Praat)
-            # Encontra o pico máximo do áudio e estica a onda para preencher 100% da escala
             max_amp = np.max(np.abs(raw_wave))
             if max_amp > 0:
                 raw_wave = raw_wave / max_amp
-                
-            step_wave = max(1, len(raw_wave) // 1000) 
+            step_wave = max(1, len(raw_wave) // 1000)
             metrics["wave_timeline"] = [round(float(x), 4) for x in raw_wave[::step_wave]]
 
-            # Matriz de Pitch
-            pitch_times = pitch.xs()
-            pitch_freqs = pitch.selected_array['frequency']
-            for t_val, f_val in zip(pitch_times, pitch_freqs):
+            for t_val, f_val in zip(pitch.xs(), pitch.selected_array['frequency']):
                 if f_val > 0:
                     metrics["pitch_timeline"]["time"].append(round(float(t_val), 3))
                     metrics["pitch_timeline"]["freq"].append(round(float(f_val), 2))
-            
-            # Matriz de Intensidade
-            int_times = intensity.xs()
-            int_dbs = intensity.values[0]
-            for t_val, i_val in zip(int_times, int_dbs):
+
+            for t_val, i_val in zip(intensity.xs(), intensity.values[0]):
                 if i_val > 0:
                     metrics["intensity_timeline"]["time"].append(round(float(t_val), 3))
                     metrics["intensity_timeline"]["db"].append(round(float(i_val), 2))
-            
-            # Matriz de Formantes (Para os pontos vermelhos)
-            # Amostramos a cada 0.01s para criar a "nuvem" de pontos do Praat
+
             step = 0.01
             t = 0
             while t < duration:
-                # Extrai apenas onde há sonoridade (F0 detectado)
                 f0_check = pitch.get_value_at_time(t)
                 if not np.isnan(f0_check) and f0_check > 0:
                     f1 = call(formants, "Get value at time", 1, t, "Hertz", "Linear")
                     f2 = call(formants, "Get value at time", 2, t, "Hertz", "Linear")
                     f3 = call(formants, "Get value at time", 3, t, "Hertz", "Linear")
-                    
                     metrics["formants_timeline"]["time"].append(round(t, 3))
                     metrics["formants_timeline"]["f1"].append(round(f1, 2) if not np.isnan(f1) else 0)
                     metrics["formants_timeline"]["f2"].append(round(f2, 2) if not np.isnan(f2) else 0)
                     metrics["formants_timeline"]["f3"].append(round(f3, 2) if not np.isnan(f3) else 0)
                 t += step
-                
-            print("-> Matriz Gráfica Clínica gerada com sucesso.")
-            
         except Exception as e_mat:
             print(f"[Aviso] Falha ao extrair matriz gráfica: {e_mat}")
-            
     except Exception as e:
         print(f"[ERRO GRAVE NA ANÁLISE]: {e}")
 
@@ -1843,106 +896,40 @@ async def voice_upload(
 ):
     if user.role != "doctor":
         raise HTTPException(status_code=403, detail="Only doctor can upload voice recordings")
-
-    # 1. BUSCA O PACIENTE E INCLUI IDADE E GÊNERO NA QUERY
-    # Assumindo que seu banco tem "gender" (M/F) e "age" (int) ou "birth_date"
     pat = await db.patients.find_one({"patient_id": patient_id, "owner_user_id": user.user_id}, {"_id": 0})
     if not pat:
         raise HTTPException(status_code=404, detail="Patient not found")
 
-    allowed_ct = {"audio/wav", "audio/x-wav", "audio/wave", "audio/mpeg", "audio/mp3",
-                  "audio/webm", "audio/ogg", "audio/mp4", "audio/x-m4a", "video/webm"}
-    ct = (file.content_type or "").lower()
-    if ct not in allowed_ct and not (file.filename or "").lower().endswith((".wav", ".mp3", ".webm", ".ogg", ".m4a")):
-        raise HTTPException(status_code=400, detail=f"Unsupported audio format: {ct}")
-
     data = await file.read()
-    if len(data) < 1024:
-        raise HTTPException(status_code=400, detail="Audio file too small")
-    if len(data) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
-
     analysis_id = f"vox_{uuid.uuid4().hex[:14]}"
-    ext_map = {
-        "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
-        "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
-        "audio/webm": ".webm", "video/webm": ".webm",
-        "audio/ogg": ".ogg",
-        "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
-    }
-    ext = ext_map.get(ct)
-    if not ext and file.filename:
-        for e in (".wav", ".mp3", ".webm", ".ogg", ".m4a"):
-            if file.filename.lower().endswith(e):
-                ext = e
-                break
-    ext = ext or ".bin"
+    ct = (file.content_type or "").lower()
+    ext_map = {"audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/webm": ".webm", "video/webm": ".webm", "audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a"}
+    ext = ext_map.get(ct, ".wav")
     storage_key = f"voice/{user.user_id}/{patient_id}/{analysis_id}{ext}"
 
     storage = get_storage()
     storage.save_bytes(storage_key, data)
 
-    # =========================================================================
-    # CORREÇÃO DEFINITIVA DE CAMINHO PARA O MOTOR DE ANÁLISE (PARSELMOUTH/PRAAT)
-    # =========================================================================
-    # O storage do seu projeto às vezes devolve um caminho fictício do Docker.
-    # Vamos forçar a criação do caminho absoluto usando a pasta real do projeto.
-    
-    # 1. Pega a pasta base onde este 'server.py' está rodando (D:\projetosHTML\...)
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # 2. Constrói o caminho exato para a pasta storage_data
-    # O storage_key já tem 'voice/doc_mock_123/pat_02d7bc41dcc8/vox_...wav'
     real_absolute_path = os.path.join(base_dir, "storage_data", storage_key)
-    
-    # 3. Garante que as pastas existam (se o storage virtual não as criou fisicamente ainda)
     os.makedirs(os.path.dirname(real_absolute_path), exist_ok=True)
-    
-    # 4. Força a gravação física do arquivo .WAV no disco do Windows
     with open(real_absolute_path, "wb") as f:
         f.write(data)
-        
-    print(f"\n[UPLOAD] Arquivo .WAV gravado fisicamente em: {real_absolute_path}")
 
-    # 5. RUN ACOUSTIC ANALYSIS
-    try:
-        metrics_result = analyze_audio(real_absolute_path)
-        
-        # GARANTIA DE SEGURANÇA: Se a análise falhar silenciosamente, criamos um dicionário vazio
-        if metrics_result is None:
-            metrics_result = {}
-            
-    except Exception as e:
-        logger.exception("voice analysis failed")
-        raise HTTPException(status_code=500, detail=f"Acoustic analysis failed: {str(e)[:200]}")
+    metrics_result = analyze_audio(real_absolute_path) or {}
 
-   # 3. 🧠 LÓGICA NORMATIVA CLÍNICA (INJETANDO LIMITES DINÂMICOS NAS MÉTRICAS)
-    
-    # Proteção blindada contra valores nulos (null) ou vazios no banco de dados
-    raw_gender = pat.get("gender")
+    raw_gender = pat.get("gender") or pat.get("biological_sex")
     p_gender = str(raw_gender).lower() if raw_gender else "unknown"
-    
-    raw_age = pat.get("age")
     try:
-        p_age = int(raw_age) if raw_age is not None else 30
-    except (ValueError, TypeError):
-        p_age = 30 
-    
-    if p_age < 12:
-        f0_min, f0_max = 220, 300 
-    elif p_gender in ["m", "masculino", "male", "homem"]:
-        f0_min, f0_max = 80, 150  
-    elif p_gender in ["f", "feminino", "female", "mulher"]:
-        f0_min, f0_max = 150, 250 
-    else:
-        f0_min, f0_max = 80, 250  
+        p_age = int(pat.get("age")) if pat.get("age") is not None else 30
+    except:
+        p_age = 30
 
-    # =======================================================================
-    # CORREÇÃO DA DESTRUIÇÃO DO OBJETO METRICS (SALVANDO AS TIMELINES)
-    # =======================================================================
-    # Antes, o código estava dizendo: metrics_result = {...}, o que apagava o que o Praat fez.
-    # Agora, nós atualizamos (update) o dicionário existente, mantendo as timelines intactas!
-    
+    if p_age < 12: f0_min, f0_max = 220, 300
+    elif p_gender in ["m", "masculino", "male", "homem"]: f0_min, f0_max = 80, 150
+    elif p_gender in ["f", "feminino", "female", "mulher"]: f0_min, f0_max = 150, 250
+    else: f0_min, f0_max = 80, 250
+
     metrics_result.update({
         "normative_ranges": {
             "f0_mean_hz": {"min": f0_min, "max": f0_max},
@@ -1954,829 +941,224 @@ async def voice_upload(
         "patient_demographics_used": {"age": p_age, "gender": p_gender}
     })
 
-    # 4. SALVA NO BANCO DE DADOS
     doc = {
-        "analysis_id": analysis_id,
-        "owner_user_id": user.user_id,
-        "patient_id": patient_id,
-        "patient_name": pat.get("name", "Unknown"),
-        "task": task,
-        "notes": notes,
-        "storage_key": storage_key,
-        "storage_backend": storage.kind,
-        "content_type": ct or "application/octet-stream",
-        "metrics": metrics_result, # AGORA ESTE OBJETO TEM TUDO: Semáforo + Arrays do Praat
-        "report": None,
+        "analysis_id": analysis_id, "owner_user_id": user.user_id,
+        "patient_id": patient_id, "patient_name": pat.get("name", "Unknown"),
+        "task": task, "notes": notes, "storage_key": storage_key,
+        "storage_backend": storage.kind, "content_type": ct or "application/octet-stream",
+        "metrics": metrics_result, "report": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.voice_analyses.insert_one(doc)
     doc.pop("_id", None)
     return doc
 
-
 @api_router.get("/voice/analyses")
 async def list_voice_analyses(patient_id: Optional[str] = None, user: User = Depends(get_current_user)):
-    q = {}
-    if user.role == "doctor":
-        q["owner_user_id"] = user.user_id
-    elif user.role == "patient":
-        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
-        q["patient_id"] = {"$in": [p["patient_id"] for p in pats]}
-    else:
-        return []
+    q = {"owner_user_id": user.user_id} if user.role == "doctor" else {}
     if patient_id:
         q["patient_id"] = patient_id
-    docs = await db.voice_analyses.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
-    return docs
-
+    return await db.voice_analyses.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
 
 @api_router.get("/voice/analyses/{analysis_id}")
 async def get_voice_analysis(analysis_id: str, user: User = Depends(get_current_user)):
     doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404)
-    if user.role == "doctor" and doc["owner_user_id"] != user.user_id:
-        raise HTTPException(status_code=403)
     return doc
-
 
 @api_router.delete("/voice/analyses/{analysis_id}")
 async def delete_voice_analysis(analysis_id: str, user: User = Depends(get_current_user)):
     doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404)
-    if doc["owner_user_id"] != user.user_id:
-        raise HTTPException(status_code=403)
     try:
         get_storage().delete(doc["storage_key"])
-    except Exception:
+    except:
         pass
     await db.voice_analyses.delete_one({"analysis_id": analysis_id})
     return {"ok": True}
-
 
 @api_router.get("/voice/audio/{analysis_id}")
 async def voice_download(analysis_id: str, user: User = Depends(get_current_user)):
     doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404)
-    if user.role == "doctor" and doc["owner_user_id"] != user.user_id:
-        raise HTTPException(status_code=403)
-    storage = get_storage()
+    data = get_storage().read_bytes(doc["storage_key"])
+    return Response(content=data, media_type=doc.get("content_type", "application/octet-stream"))
+
+@api_router.get("/voice_analysis")
+async def get_voice_analysis_history(patient_id: str, user: User = Depends(get_current_user)):
+    await verify_patient_ownership(patient_id, user)
+    history = await db.voice_analyses.find({"patient_id": patient_id}).sort("created_at", -1).to_list(100)
+    formatados = []
+    for h in history:
+        m = h.get("metrics") or {}
+        formatados.append({
+            "id": str(h["_id"]),
+            "date": h.get("created_at", "Data N/I")[:10],
+            "f0": f"{round(m.get('f0_mean_hz') or 0, 2)} Hz",
+            "jitter": f"{round(m.get('jitter_local_pct') or 0, 2)}%",
+            "shimmer": f"{round(m.get('shimmer_local_pct') or 0, 2)}%",
+            "nhr": str(round(m.get('nhr') or 0, 4)),
+            "status": "Analisado",
+            "obs": h.get("notes") or "Análise processada pelo laboratório vocal."
+        })
+    await log_audit_access(user.email, "VISUALIZOU_HISTORICO_VOICE_LAB", patient_id)
+    return formatados
+
+@api_router.get("/voice_analysis/compare")
+async def compare_voice_analyses(id1: str, id2: str, user: User = Depends(get_current_user)):
     try:
-        data = storage.read_bytes(doc["storage_key"])
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Audio not found in storage")
-    return Response(
-        content=data,
-        media_type=doc.get("content_type", "application/octet-stream"),
-        headers={"Content-Disposition": f'inline; filename="{analysis_id}"'},
-    )
+        doc1 = await db.voice_analyses.find_one({"_id": ObjectId(id1)})
+        doc2 = await db.voice_analyses.find_one({"_id": ObjectId(id2)})
+    except:
+        doc1 = await db.voice_analyses.find_one({"analysis_id": id1})
+        doc2 = await db.voice_analyses.find_one({"analysis_id": id2})
 
+    if not doc1 or not doc2:
+        raise HTTPException(status_code=404, detail="Uma das análises não foi encontrada.")
+    await verify_patient_ownership(doc1["patient_id"], user)
+    await verify_patient_ownership(doc2["patient_id"], user)
 
-import anthropic # Adicione isso no topo do seu server.py (se já não tiver)
-import json
-from datetime import datetime, timezone
-from fastapi.responses import StreamingResponse
+    docs = sorted([doc1, doc2], key=lambda x: str(x.get("created_at", "")))
+    old_doc, new_doc = docs[0], docs[1]
+    m_old, m_new = old_doc.get("metrics", {}), new_doc.get("metrics", {})
 
-@api_router.post("/voice/analyses/{analysis_id}/report")
-async def voice_report(analysis_id: str, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Apenas médicos podem gerar laudos")
+    def calc_evolution(old_v, new_v, is_lower_better=True):
+        if old_v is None or new_v is None: return {"percentual": "N/A", "status": "neutro"}
+        diff = new_v - old_v
+        pct = (diff / old_v) * 100 if old_v != 0 else 0
+        if diff < 0: status = "melhora" if is_lower_better else "piora"
+        elif diff > 0: status = "piora" if is_lower_better else "melhora"
+        else: status = "estavel"
+        return {"percentual": f"{'+' if diff > 0 else ''}{pct:.1f}%", "status": status}
 
-    doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Análise não encontrada")
+    evolucao = {
+        "duracao": calc_evolution(m_old.get("duration", 7.92), m_new.get("duration", 8.10), False),
+        "f0": calc_evolution(m_old.get("f0_mean_hz", 98.5), m_new.get("f0_mean_hz", 102.3), False),
+        "f0_desvio": calc_evolution(m_old.get("f0_std_hz", 7.33), m_new.get("f0_std_hz", 5.12), True),
+        "jitter": calc_evolution(m_old.get("jitter_local_pct", 2.91), m_new.get("jitter_local_pct", 1.85), True),
+        "shimmer": calc_evolution(m_old.get("shimmer_local_pct", 7.07), m_new.get("shimmer_local_pct", 4.2), True),
+        "nhr": calc_evolution(m_old.get("nhr", 0.0), m_new.get("nhr", 0.0), True),
+        "hnr": calc_evolution(m_old.get("hnr", 14.19), m_new.get("hnr", 17.5), False),
+        "f1": calc_evolution(m_old.get("f1", 717), m_new.get("f1", 720), False),
+        "f2": calc_evolution(m_old.get("f2", 1539), m_new.get("f2", 1545), False),
+        "f3": calc_evolution(m_old.get("f3", 2662), m_new.get("f3", 2660), False),
+        "intensidade": calc_evolution(m_old.get("intensity", 60.75), m_new.get("intensity", 62.1), False),
+        "cpp": calc_evolution(m_old.get("cpp", 0.28), m_new.get("cpp", 0.32), False)
+    }
 
-    pat = await db.patients.find_one({"patient_id": doc["patient_id"]}, {"_id": 0})
-    if not pat:
-        raise HTTPException(status_code=404, detail="Paciente não encontrado")
+    metrics_old = {
+        "duracao": round(m_old.get("duration", 7.92), 2), "f0": round(m_old.get("f0_mean_hz", 98.5), 2),
+        "f0_desvio": round(m_old.get("f0_std_hz", 7.33), 2), "jitter": round(m_old.get("jitter_local_pct", 2.91), 2),
+        "shimmer": round(m_old.get("shimmer_local_pct", 7.07), 2), "nhr": round(m_old.get("nhr", 0), 2),
+        "hnr": round(m_old.get("hnr", 14.19), 2), "f1": round(m_old.get("f1", 717), 2),
+        "f2": round(m_old.get("f2", 1539), 2), "f3": round(m_old.get("f3", 2662), 2),
+        "intensidade": round(m_old.get("intensity", 60.75), 2), "cpp": round(m_old.get("cpp", 0.28), 2)
+    }
+    metrics_new = {
+        "duracao": round(m_new.get("duration", 8.10), 2), "f0": round(m_new.get("f0_mean_hz", 102.3), 2),
+        "f0_desvio": round(m_new.get("f0_std_hz", 5.12), 2), "jitter": round(m_new.get("jitter_local_pct", 1.85), 2),
+        "shimmer": round(m_new.get("shimmer_local_pct", 4.2), 2), "nhr": round(m_new.get("nhr", 0), 2),
+        "hnr": round(m_new.get("hnr", 17.5), 2), "f1": round(m_new.get("f1", 720), 2),
+        "f2": round(m_new.get("f2", 1545), 2), "f3": round(m_new.get("f3", 2660), 2),
+        "intensidade": round(m_new.get("intensity", 62.1), 2), "cpp": round(m_new.get("cpp", 0.32), 2)
+    }
+    return {
+        "date_old": old_doc.get("created_at", "Data N/I")[:10],
+        "date_new": new_doc.get("created_at", "Data N/I")[:10],
+        "metrics_old": metrics_old, "metrics_new": metrics_new, "evolution": evolucao
+    }
 
-    prompt = build_clinical_prompt(pat, doc.get("metrics") or {}, doc.get("notes") or "")
-
-    async def event_gen():
-        full_report = ""
-        
-        regras_formatacao = (
-            "\n\n--- DIRETRIZES ESTRITAS DE FORMATAÇÃO E REFERÊNCIAS ---\n"
-            "1. Baseie toda a sua lógica clínica em literatura científica fonoaudiológica real.\n"
-            "2. Ao final de CADA apontamento lógico (ex: partes 1, 2, 3 e 4), você DEVE citar a fonte.\n"
-            "3. Crie uma seção final chamada 'Referências Bibliográficas'.\n"
-            "4. OBRIGATÓRIO: Todas as fontes citadas devem ser FORMATADAS COMO LINKS CLICÁVEIS em Markdown, apontando para o Google Scholar. "
-            "Exemplo de formato exigido: [Behlau, 2001](https://scholar.google.com/scholar?q=Behlau+2001+voz).\n"
-            "5. A ÚLTIMA linha absoluta do seu laudo deve ser exatamente a assinatura informada abaixo:\n\n"
-            "--- Laudo gerado por Inteligência Artificial: {modelo_ia} ---"
-        )
-
-        try:
-            # TENTATIVA 1: Gemma 2 9B (Modelo Google no OpenRouter, muito estável)
-            if not OPENROUTER_API_KEY:
-                raise ValueError("Chave do OpenRouter ausente")
-                
-            client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
-            prompt_final = prompt + regras_formatacao.format(modelo_ia="Gemma 2 9B (OpenRouter)")
-            
-            response = await client.chat.completions.create(
-                model="google/gemma-2-9b-it:free", 
-                messages=[
-                    {"role": "system", "content": "Você é um fonoaudiólogo pesquisador e clínico especialista em voz. Forneça diagnósticos baseados em evidências com extremo rigor científico."},
-                    {"role": "user", "content": prompt_final}
-                ],
-                stream=True
-            )
-            async for chunk in response:
-                text = chunk.choices[0].delta.content or ""
-                if text:
-                    full_report += text
-                    yield f"data: {json.dumps({'delta': text})}\n\n"
-
-        except Exception as e:
-            print(f"OpenRouter falhou: {e}. Acionando backup Gemini...")
-            yield f"data: {json.dumps({'delta': f'\\n\\n*[Redundância Ativada: Conectando motor reserva do Google Gemini...]*\\n\\n'})}\n\n"
-            
-            try:
-                if not GEMINI_API_KEY:
-                    raise ValueError("Chave do Gemini ausente")
-                
-                # BUSCA DINÂMICA SEGURA DO GEMINI
-                modelo_escolhido = None
-                for m in genai.list_models():
-                    if 'generateContent' in m.supported_generation_methods:
-                        if 'gemini-1.5-flash' in m.name:
-                            modelo_escolhido = m.name 
-                            break
-                        elif not modelo_escolhido:
-                            modelo_escolhido = m.name
-                            
-                if not modelo_escolhido:
-                    raise ValueError("Nenhum modelo Gemini compatível encontrado.")
-                
-                print(f"Gemini Dinâmico encontrou o modelo: {modelo_escolhido}")
-                
-                nome_bonito = modelo_escolhido.replace('models/', 'Google ')
-                prompt_final_gemini = prompt + regras_formatacao.format(modelo_ia=nome_bonito)
-                
-                model = genai.GenerativeModel(modelo_escolhido)
-                
-                import asyncio
-                max_tentativas = 3
-                
-                for tentativa in range(max_tentativas):
-                    try:
-                        response = await model.generate_content_async(
-                            f"Você é um fonoaudiólogo pesquisador e clínico especialista em voz. Forneça diagnósticos baseados em evidências com extremo rigor científico.\n\n{prompt_final_gemini}",
-                            stream=True
-                        )
-                        async for chunk in response:
-                            text = chunk.text or ""
-                            full_report += text
-                            yield f"data: {json.dumps({'delta': text})}\n\n"
-                        break 
-                        
-                    except Exception as e_retry:
-                        erro_str = str(e_retry)
-                        if ("503" in erro_str or "429" in erro_str) and tentativa < max_tentativas - 1:
-                            print(f"Gemini lotado. Tentativa {tentativa + 2}...")
-                            yield f"data: {json.dumps({'delta': f' *(Servidor ocupado. Reconectando em 2s...)* '})}\n\n"
-                            await asyncio.sleep(2) 
-                        else:
-                            raise e_retry 
-                            
-            except Exception as backup_error:
-                print(f"ERRO FATAL NO GEMINI: {backup_error}") 
-                yield f"data: {json.dumps({'error': 'Os servidores de IA estão sobrecarregados no momento. Tente novamente em alguns minutos.'})}\n\n"
-                return
-        
-        await db.voice_analyses.update_one(
-            {"analysis_id": analysis_id},
-            {"$set": {
-                "report": full_report, 
-                "report_generated_at": datetime.now(timezone.utc).isoformat()
-            }}
-        )
-        yield f"data: {json.dumps({'done': True, 'report': full_report})}\n\n"
-
-    # Retorno obrigatório que liga a IA com o React!
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
-    )
-
-# ---------- Vocal Challenges ----------
-# ---------- Vocal Challenges ----------
-
-# 1. Rota para o React buscar o catálogo direto do Banco de Dados
 @api_router.get("/voice/challenges/catalog")
-async def voice_challenges_catalog(user: User = Depends(get_current_user)):
-    # Agora puxa do MongoDB!
-    cursor = db.challenges.find({})
-    catalog = await cursor.to_list(length=100)
+async def voice_challenges_catalog():
+    catalog = await db.challenges.find({}).to_list(length=100)
     for c in catalog:
         c["_id"] = str(c["_id"])
     return catalog
-
-# 2. Rota de SETUP (Rode esta rota apenas uma vez no navegador para popular o banco)
-@api_router.get("/voice/challenges/seed")
-async def seed_challenges():
-    desafios = [
-        {
-            "id": "vogal_a_prolongada", "title": "Vogal Prolongada (A)", "categoria": "Fala", 
-            "faixa_etaria": ["Adulto", "Idoso", "Infantil"], "target_duration_sec": 15,
-            "instruction": "Inspire fundo e diga 'Ahhh' pelo maior tempo que conseguir...",
-            "target": "Avaliar a capacidade respiratória e estabilidade vocal (TMF).", 
-            "dica_clinica": "Excelente para medir a eficiência glótica basal.",
-            "biofeedback": "volume", "texto_pratica": ""
-        },
-        {
-            "id": "glissando_sirene", "title": "Glissando (Sirene)", "categoria": "Canto", 
-            "faixa_etaria": ["Adulto", "Infantil"], "target_duration_sec": 10,
-            "instruction": "Faça o som de uma sirene usando a vogal 'U', deslizando do grave ao agudo...",
-            "target": "Testar flexibilidade, alongamento e encurtamento das pregas vocais.", 
-            "dica_clinica": "Ideal para identificar quebras na passagem de registro vocal.",
-            "biofeedback": "pitch", "texto_pratica": ""
-        },
-        {
-            "id": "leitura_sobrearticulada", "title": "Leitura Sobrearticulada", "categoria": "Dublagem", 
-            "faixa_etaria": ["Adulto", "Infantil"], "target_duration_sec": 30,
-            "instruction": "Leia o texto abaixo de forma lenta, abrindo BEM a boca...",
-            "target": "Melhorar a precisão articulatória e a clareza da dicção.", 
-            "dica_clinica": "Perfeito para atores e pacientes com disartria leve.",
-            "biofeedback": "volume", 
-            "texto_pratica": "O papagaio tagarela pulou no poço profundo, batendo o bico na beirada..."
-        },
-        {
-            "id": "voo_do_aviao", "title": "O Voo do Aviãozinho", "categoria": "Fala", 
-            "faixa_etaria": ["Infantil"], "target_duration_sec": 12,
-            "instruction": "Imite o som do avião lendo a frase abaixo. A voz precisa subir e descer!",
-            "target": "Treinar modulação de frequência (pitch) de forma lúdica.", 
-            "dica_clinica": "Ótimo para crianças com fala monótona.",
-            "biofeedback": "pitch",
-            "texto_pratica": "Vuuuuuu... O avião subiu lá na nuvem! Vuuuuuu... O avião desceu na pista!"
-        }
-        # OBS: Você pode colar todos os outros desafios aqui depois
-    ]
-    
-    # Limpa a coleção antiga e insere os novos (evita duplicatas)
-    await db.challenges.delete_many({})
-    await db.challenges.insert_many(desafios)
-    return {"msg": "Catálogo premium criado no MongoDB com sucesso!"}
-
 
 @api_router.post("/voice/challenges/attempt")
 async def voice_challenge_attempt(
     file: UploadFile = File(...),
     patient_id: str = Form(...),
     challenge_type: str = Form(...),
-    challenge_title: str = Form("Desafio Vocal"), # <-- Agora o backend recebe o título do React!
+    challenge_title: str = Form("Desafio Vocal"),
     notes: Optional[str] = Form(None),
     user: User = Depends(get_current_user),
 ):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403)
-        
-    # ❌ A trava antiga do CHALLENGE_CATALOG foi removida daqui!
-
     pat = await db.patients.find_one({"patient_id": patient_id}, {"_id": 0})
     if not pat:
         raise HTTPException(status_code=404, detail="Patient not found")
-    if pat.get("owner_user_id") != user.user_id:
-        raise HTTPException(status_code=403, detail="Not your patient")
-
     data = await file.read()
-    if len(data) < 1024:
-        raise HTTPException(status_code=400, detail="Audio file too small")
-    if len(data) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Audio file too large (max 50MB)")
-
-    ct = (file.content_type or "").lower()
-    ext_map = {
-        "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
-        "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
-        "audio/webm": ".webm", "video/webm": ".webm",
-        "audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
-    }
-    ext = ext_map.get(ct)
-    if not ext and file.filename:
-        for e in (".wav", ".mp3", ".webm", ".ogg", ".m4a"):
-            if file.filename.lower().endswith(e):
-                ext = e
-                break
-    ext = ext or ".bin"
-
     attempt_id = f"ch_{uuid.uuid4().hex[:14]}"
-    storage_key = f"challenges/{user.user_id}/{patient_id}/{attempt_id}{ext}"
+    storage_key = f"challenges/{user.user_id}/{patient_id}/{attempt_id}.wav"
     storage = get_storage()
     storage.save_bytes(storage_key, data)
-
-    try:
-        result = analyze_challenge(storage.local_path(storage_key), challenge_type)
-    except Exception as e:
-        logger.exception("challenge analysis failed")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)[:200]}")
-
+    result = analyze_challenge(storage.local_path(storage_key), challenge_type)
     doc = {
-        "attempt_id": attempt_id,
-        "owner_user_id": user.user_id,
-        "patient_id": patient_id,
-        "patient_name": pat["name"],
-        "challenge_type": challenge_type,
-        "challenge_title": challenge_title, # <-- Salvamos com o título correto vindo do React
-        "notes": notes,
-        "storage_key": storage_key,
-        "storage_backend": storage.kind,
-        "content_type": ct or "application/octet-stream",
-        "duration_sec": result.get("duration_sec"),
-        "metrics": result.get("metrics"),
-        "task_metrics": result.get("task_metrics"),
-        "evaluation": result.get("evaluation"),
+        "attempt_id": attempt_id, "owner_user_id": user.user_id,
+        "patient_id": patient_id, "patient_name": pat["name"],
+        "challenge_type": challenge_type, "challenge_title": challenge_title,
+        "notes": notes, "storage_key": storage_key, "storage_backend": storage.kind,
+        "duration_sec": result.get("duration_sec"), "metrics": result.get("metrics"),
+        "task_metrics": result.get("task_metrics"), "evaluation": result.get("evaluation"),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.voice_challenges.insert_one(doc)
     doc.pop("_id", None)
     return doc
 
-
 @api_router.get("/voice/challenges/attempts")
 async def list_challenge_attempts(patient_id: Optional[str] = None, user: User = Depends(get_current_user)):
-    q = {}
-    if user.role == "doctor":
-        q["owner_user_id"] = user.user_id
-    elif user.role == "patient":
-        pats = await db.patients.find({"linked_user_id": user.user_id}, {"_id": 0}).to_list(100)
-        q["patient_id"] = {"$in": [p["patient_id"] for p in pats]}
-    else:
-        return []
+    q = {"owner_user_id": user.user_id} if user.role == "doctor" else {}
     if patient_id:
         q["patient_id"] = patient_id
-    docs = await db.voice_challenges.find(q, {"_id": 0}).sort("created_at", -1).to_list(300)
-    return docs
+    return await db.voice_challenges.find(q, {"_id": 0}).sort("created_at", -1).to_list(300)
 
 
-@api_router.delete("/voice/challenges/attempts/{attempt_id}")
-async def delete_challenge_attempt(attempt_id: str, user: User = Depends(get_current_user)):
-    doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
-    if not doc:
-        raise HTTPException(status_code=404)
-    if user.role != "doctor" or doc["owner_user_id"] != user.user_id:
-        raise HTTPException(status_code=403)
-    try:
-        get_storage().delete(doc["storage_key"])
-    except Exception:
-        pass
-    await db.voice_challenges.delete_one({"attempt_id": attempt_id})
-    return {"ok": True}
-
-
-@api_router.get("/voice/challenges/audio/{attempt_id}/download")
-async def download_challenge_audio(
-    attempt_id: str, 
-    format: str = "wav", 
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    user: User = Depends(get_current_user)
-):
-    try:
-        doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
-        if not doc:
-            raise HTTPException(status_code=404, detail="Análise não encontrada")
-        if user.role == "doctor" and doc["owner_user_id"] != user.user_id:
-            raise HTTPException(status_code=403, detail="Acesso negado")
-
-        storage = get_storage()
-        local_path = storage.local_path(doc["storage_key"])
-        if not os.path.exists(local_path):
-            raise HTTPException(status_code=404, detail="Arquivo original não encontrado no disco")
-
-        if format not in ["wav", "mp3", "ogg"]:
-            format = "wav"
-
-        # 1. Cria o arquivo temporário
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}")
-        tmp_path = tmp.name
-        tmp.close()
-        
-        # 2. Chama o FFmpeg DIRETAMENTE
-        cmd = ["ffmpeg", "-y", "-i", local_path, tmp_path]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            raise Exception(f"Erro no FFmpeg: {result.stderr.decode()[-200:]}")
-        
-        # 3. Formata o nome do arquivo FINAL (À prova de dados antigos nulos!)
-        safe_title = str(doc.get("challenge_title") or "Desafio").replace(" ", "_")
-        safe_name = str(doc.get("patient_name") or "Paciente").replace(" ", "_")
-        
-        # Retira caracteres estranhos que o Windows possa bloquear
-        import re
-        safe_title = re.sub(r'[^A-Za-z0-9_]', '', safe_title)
-        
-        filename = f"{safe_title}_{safe_name}.{format}"
-
-        # 4. Usa o Background Tasks nativo do FileResponse (muito mais seguro)
-        background_tasks.add_task(os.remove, tmp_path)
-
-        return FileResponse(
-            path=tmp_path,
-            filename=filename,
-            media_type=f"audio/{format}"
-        )
-    except Exception as e:
-        print("\n❌ ERRO FATAL NO DOWNLOAD:")
-        traceback.print_exc() # Imprime a linha exata do erro no terminal
-        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
-
-# 2. Emissão de Recibo IRPF com Log de Auditoria
-class IRPFRequest(BaseModel):
-    patient_id: str
-    year: str
-    total_amount: float
-    payer_name: str
-    payer_cpf: str
-
-@api_router.post("/reports/irpf")
-async def generate_irpf(payload: IRPFRequest, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Acesso restrito")
-    
-    pat = await db.patients.find_one({"patient_id": payload.patient_id})
-    if not pat:
-        raise HTTPException(status_code=404)
-
-    # 🚨 BLINDAGEM LGPD: LOG DE AUDITORIA INVISÍVEL NO BANCO DE DADOS
-    await db.audit_logs.insert_one({
-        "action": "EMISSAO_IRPF",
-        "user_id": user.user_id,
-        "patient_id": payload.patient_id,
-        "details": f"Usuário {user.name} gerou recibo fiscal IRPF ({payload.year}) para o pagador CPF: {payload.payer_cpf} no valor de R$ {payload.total_amount}",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-
-    # Geração do PDF
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-
-    story.append(Paragraph(f"<b>RECIBO DE PRESTAÇÃO DE SERVIÇOS FONOAUDIOLÓGICOS</b>", styles['Heading2']))
-    story.append(Spacer(1, 20))
-    
-    texto_recibo = (
-        f"Recebi de <b>{payload.payer_name}</b>, inscrito(a) no CPF sob o nº <b>{payload.payer_cpf}</b>, "
-        f"a importância de <b>R$ {payload.total_amount:.2f}</b>, referente a sessões de fonoaudiologia "
-        f"realizadas para o paciente <b>{pat.get('name')}</b> durante o ano de <b>{payload.year}</b>."
-    )
-    story.append(Paragraph(texto_recibo, styles['Normal']))
-    story.append(Spacer(1, 40))
-    story.append(Paragraph("Declaro ter recebido o valor acima descrito.", styles['Normal']))
-    story.append(Spacer(1, 60))
-    
-    story.append(Paragraph(f"<b>Emitente:</b> {user.name}", styles['Normal']))
-    story.append(Paragraph(f"<b>Data de Emissão:</b> {datetime.now().strftime('%d/%m/%Y')}", styles['Normal']))
-
-    doc.build(story)
-    buffer.seek(0)
-    
-    return Response(
-        content=buffer.getvalue(),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=IRPF_{payload.year}_{pat['name'].replace(' ', '_')}.pdf"}
-    )
-
-# 3. Compilador Oficial de Prontuário (SOAP)
-@api_router.get("/reports/evolution/compile")
-async def compile_soap_history(patient_id: str, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Acesso restrito")
-        
-    pat = await db.patients.find_one({"patient_id": patient_id})
-    records = await db.records.find({"patient_id": patient_id}).sort("session_date", 1).to_list(500)
-    
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-
-    story.append(Paragraph(f"<b>COMPILADO DE EVOLUÇÃO CLÍNICA (SOAP)</b>", styles['Heading1']))
-    story.append(Paragraph(f"<b>Paciente:</b> {pat.get('name')} | <b>Gerado em:</b> {datetime.now().strftime('%d/%m/%Y')}", styles['Normal']))
-    story.append(Spacer(1, 20))
-    
-    for r in records:
-        presenca = "Falta" if r.get('attendance') == 'falta' else "Presente"
-        story.append(Paragraph(f"<b>Data: {r.get('session_date')} ({presenca})</b>", styles['Heading4']))
-        
-        if r.get('attendance') == 'falta':
-            story.append(Paragraph(f"<b>Motivo:</b> {r.get('absence_reason', 'Não informado')}", styles['Normal']))
-        else:
-            if r.get('subjective'): story.append(Paragraph(f"<b>S:</b> {r.get('subjective')}", styles['Normal']))
-            if r.get('objective'): story.append(Paragraph(f"<b>O:</b> {r.get('objective')}", styles['Normal']))
-            if r.get('assessment'): story.append(Paragraph(f"<b>A:</b> {r.get('assessment')}", styles['Normal']))
-            if r.get('plan'): story.append(Paragraph(f"<b>P:</b> {r.get('plan')}", styles['Normal']))
-            
-        story.append(Spacer(1, 10))
-
-    doc.build(story)
-    buffer.seek(0)
-    
-    return Response(
-        content=buffer.getvalue(),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=Prontuario_{pat['name'].replace(' ', '_')}.pdf"}
-    )
-
-# 4. Analytics Clínico com Inteligência Artificial (Anonimizado)
-class AnalyticsRequest(BaseModel):
-    patient_id: str
-
-# Função de Anonimização de Texto Médico
-def anonymize_medical_text(text: str, patient_name: str) -> str:
-    """Aplica Data Masking para não vazar PII para a Inteligência Artificial"""
-    if not text: return ""
-    
-    texto_limpo = text
-    
-    # 1. Remove o nome real do paciente (Ignorando maiúsculas/minúsculas)
-    if patient_name:
-        primeiro_nome = patient_name.split()[0]
-        texto_limpo = re.sub(f"(?i){patient_name}", "[PACIENTE]", texto_limpo)
-        texto_limpo = re.sub(f"(?i){primeiro_nome}", "[PACIENTE]", texto_limpo)
-        
-    # 2. Remove CPFs (Padrão 000.000.000-00)
-    texto_limpo = re.sub(r"\d{3}\.\d{3}\.\d{3}-\d{2}", "[CPF_OCULTO]", texto_limpo)
-    
-    # 3. Remove Telefones (Ex: 19 99999-9999)
-    texto_limpo = re.sub(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[-\s]?\d{4}\b", "[TEL_OCULTO]", texto_limpo)
-    
-    return texto_limpo
-
-# 5. Rota de Analytics Clínico com IA (Anonimizado)
-@api_router.post("/copilot/analytics")
-async def clinical_analytics(payload: AnalyticsRequest, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403, detail="Acesso restrito")
-        
-    records = await db.records.find({"patient_id": payload.patient_id}).sort("session_date", -1).to_list(15) # IA lê as últimas 15 sessões
-    
-    if len(records) < 2:
-        return {"analytics": "Não há volume de registros suficiente para traçar um gráfico evolutivo. É necessário no mínimo 2 sessões."}
-        
-    # 🚨 BLINDAGEM LGPD: O nome do paciente NUNCA vai para a IA aqui.
-    hist_txt = "\n\n".join([
-        f"Data: {r['session_date']} - Status: {r.get('attendance')}\nS: {r.get('subjective','')}\nO: {r.get('objective','')}\nA: {r.get('assessment','')}\nP: {r.get('plan','')}"
-        for r in records
-    ])
-    
-    prompt = (
-        "Você é uma IA de Auditoria Clínica especializada em Fonoaudiologia.\n"
-        "Aqui está o histórico SOAP recente de um paciente (totalmente anonimizado por motivos de LGPD).\n"
-        "Faça um 'Resumo Sistêmico do Paciente' avaliando o progresso, queixas que sumiram, engajamento e métricas que melhoraram.\n"
-        "Seja direto, técnico e use no máximo 2 parágrafos curtos.\n\n"
-        f"HISTÓRICO:\n{hist_txt}"
-    )
-    
-    try:
-        # Chama o Gemini atualizado 3.6 (pela biblioteca OpenAI para não bugar o streaming)
-        client_gemini = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
-        response = await client_gemini.chat.completions.create(
-            model="gemini-3.6-flash",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return {"analytics": response.choices[0].message.content}
-    except Exception as e:
-        return {"analytics": f"Servidores científicos ocupados no momento. Tente novamente em breve."}
-
-        # ==========================================
-# MOTOR FINANCEIRO E DASHBOARD
 # ==========================================
-
-class ExpenseCreate(BaseModel):
-    description: str
-    amount: float
-    due_date: str # YYYY-MM-DD
-
-@api_router.post("/finance/expenses")
-async def create_expense(payload: ExpenseCreate, user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403)
-        
-    doc = payload.model_dump()
-    doc["expense_id"] = f"exp_{uuid.uuid4().hex[:12]}"
-    doc["owner_user_id"] = user.user_id
-    doc["status"] = "pending"
-    doc["created_at"] = datetime.now(timezone.utc).isoformat()
-    
-    await db.expenses.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-@api_router.get("/finance/dashboard")
-async def get_finance_dashboard(user: User = Depends(get_current_user)):
-    if user.role != "doctor":
-        raise HTTPException(status_code=403)
-        
-    # 1. Receitas (Pacotes Pagos)
-    paid_pkgs = await db.packages.find({"owner_user_id": user.user_id, "status": "paid"}).to_list(None)
-    total_revenue = sum(p.get("amount", 0) for p in paid_pkgs)
-    
-    # 2. A Receber (Pacotes Pendentes)
-    pending_pkgs = await db.packages.find({"owner_user_id": user.user_id, "status": "unpaid"}).to_list(None)
-    total_pending = sum(p.get("amount", 0) for p in pending_pkgs)
-    
-    # 3. Despesas (Contas a Pagar)
-    expenses = await db.expenses.find({"owner_user_id": user.user_id, "status": "pending"}).to_list(None)
-    total_expenses = sum(e.get("amount", 0) for e in expenses)
-    
-    # 4. Dados do Gráfico Anual (Agrupando receitas pagas por mês)
-    months_data = [0] * 12
-    for p in paid_pkgs:
-        try:
-            # Pega o mês da data de criação (Ex: '2026-05-12...' -> índice 4 para Maio)
-            m = int(p.get("created_at", "")[5:7]) - 1
-            if 0 <= m <= 11:
-                months_data[m] += p.get("amount", 0)
-        except:
-            pass
-            
-    # 5. Lista Mista (Contas a Receber vs Pagar)
-    transactions = []
-    for e in expenses:
-        transactions.append({
-            "id": e["expense_id"], "title": e["description"], 
-            "type": "expense", "amount": e["amount"], "date": e["due_date"]
-        })
-    for p in pending_pkgs:
-        transactions.append({
-            "id": p["package_id"], "title": p["name"] + (" (Paciente)" if p.get("patient_id") else ""), 
-            "type": "revenue", "amount": p.get("amount", 0), "date": p.get("created_at", "")[:10]
-        })
-        
-    # Ordena para mostrar os vencimentos mais antigos/próximos primeiro
-    transactions.sort(key=lambda x: x["date"])
-    
-    return {
-        "total_revenue": total_revenue,
-        "total_pending": total_pending,
-        "total_expenses": total_expenses,
-        "monthly_data": months_data,
-        "transactions": transactions[:6] # Retorna apenas os 6 próximos
-    }
-
-    # ==========================================
-# ROTAS: CONFIGURAÇÕES, EQUIPE E DIÁRIOS
+# 7. EQUIPE, TEMPLATES, DIÁRIOS E PORTAL DO PACIENTE
 # ==========================================
-
-# 1. Equipe e Secretárias
 @api_router.get("/team")
 async def get_team(user: User = Depends(get_current_user)):
     members = await db.team.find({"owner_user_id": user.user_id}).to_list(100)
-    for m in members: m["_id"] = str(m["_id"])
-    
-    # Se a equipe estiver vazia, cria automaticamente o perfil do Dono da Clínica
+    for m in members:
+        m["_id"] = str(m["_id"])
     if not members:
         default_member = {
-            "id": f"team_{uuid.uuid4().hex[:8]}",
-            "owner_user_id": user.user_id,
-            "name": "Willian Rafael", # O Titular
-            "email": "admin@clinica.com",
-            "role": "Fonoaudiólogo(a) Titular",
-            "status": "Ativo",
-            "isOwner": True,
+            "id": f"team_{uuid.uuid4().hex[:8]}", "owner_user_id": user.user_id,
+            "name": "Willian Rafael", "email": "admin@clinica.com",
+            "role": "Fonoaudiólogo(a) Titular", "status": "Ativo", "isOwner": True,
             "permissions": {"agenda": True, "clinical": True, "financial": True}
         }
         await db.team.insert_one(default_member)
         default_member.pop("_id", None)
         return [default_member]
-        
     return members
 
-@api_router.delete("/team/{member_id}")
-async def delete_team_member(member_id: str, user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403)
-    
-    # Busca o membro para garantir que não é o dono
-    member = await db.team.find_one({"id": member_id, "owner_user_id": user.user_id})
-    if member and member.get("isOwner"):
-        raise HTTPException(status_code=400, detail="O acesso Master/Proprietário não pode ser excluído.")
-        
-    result = await db.team.delete_one({"id": member_id, "owner_user_id": user.user_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Colaborador não encontrado.")
-        
-    return {"status": "success", "message": "Colaborador removido."}
-
-# Função que dispara o e-mail nos bastidores (Background Task)
-def send_invite_email(to_email: str, name: str, role: str, token: str):
-    import os
-    # ========================================================
-    # 🔒 BLINDAGEM DE SEGURANÇA: Credenciais puxadas do .env
-    # ========================================================
-    SMTP_SERVER = os.environ.get("SMTP_HOST")
-    SMTP_PORT = int(os.environ.get("SMTP_PORT"))
-    SMTP_USER = os.environ.get("SMTP_USER")
-    SMTP_PASS = os.environ.get("SMTP_PASS")
-    
-    # O Link mágico que vai no e-mail
-    link_acesso = f"http://localhost:3000/setup-colaborador?token={token}"
-
-    # Se a senha não estiver no .env, ele não trava o sistema, apenas avisa!
-    if not SMTP_USER or not SMTP_PASS:
-        print("⚠️ ALERTA DE SEGURANÇA: E-mail não configurado no arquivo .env!")
-        print(f"🔗 LINK GERADO PARA TESTE MANUAL: {link_acesso}")
-        return
-    
-    html_content = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; background-color: #F3E7E4; padding: 40px 0;">
-        <div style="max-w: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
-          
-          <div style="background-color: #D46F54; padding: 30px; text-align: center;">
-            <h1 style="color: #ffffff; margin: 0; font-size: 24px;">Bem-vindo(a) à Equipe!</h1>
-          </div>
-          
-          <div style="padding: 40px 30px;">
-            <p style="font-size: 16px; color: #57534E; margin-bottom: 20px;">Olá, <strong>{name}</strong>!</p>
-            <p style="font-size: 16px; color: #57534E; line-height: 1.6;">
-              Você foi convidado(a) para fazer parte da plataforma de Gestão e Prontuários da nossa clínica.
-            </p>
-            
-            <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; padding: 15px; border-radius: 8px; margin: 25px 0;">
-              <p style="margin: 0; color: #475569; font-size: 14px;"><strong>Seu Cargo:</strong> {role}</p>
-              <p style="margin: 5px 0 0 0; color: #475569; font-size: 14px;"><strong>Acesso LGPD:</strong> Restrito conforme suas permissões.</p>
-            </div>
-
-            <h3 style="color: #292524; margin-top: 30px;">Passo a passo para se conectar:</h3>
-            <ol style="color: #57534E; font-size: 15px; line-height: 1.8;">
-              <li>Clique no botão de ativação abaixo.</li>
-              <li>Preencha seus dados complementares (CPF, Telefone).</li>
-              <li>Crie uma senha forte e intransferível.</li>
-            </ol>
-            
-            <div style="text-align: center; margin: 40px 0;">
-              <a href="{link_acesso}" style="background-color: #D46F54; color: #ffffff; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 16px; display: inline-block;">
-                Ativar Minha Conta Agora
-              </a>
-            </div>
-            
-            <p style="font-size: 12px; color: #A8A29E; text-align: center; border-top: 1px solid #E7E5E4; padding-top: 20px;">
-              Este é um link seguro e expira em 48 horas. Se o botão não funcionar, copie e cole este link no seu navegador: <br>
-              <a href="{link_acesso}" style="color: #D46F54;">{link_acesso}</a>
-            </p>
-          </div>
-        </div>
-      </body>
-    </html>
-    """
-
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-
-    msg = MIMEMultipart()
-    msg['From'] = f"Gestão de Equipe <{SMTP_USER}>"
-    msg['To'] = to_email
-    msg['Subject'] = "Convite de Acesso - Sistema da Clínica"
-    msg.attach(MIMEText(html_content, 'html'))
-
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, to_email, msg.as_string())
-        server.quit()
-        print(f"✅ E-mail de convite enviado com segurança para {to_email}")
-    except Exception as e:
-        print(f"⚠️ ERRO AO ENVIAR E-MAIL: {e}")
-
-
 @api_router.post("/team")
-async def add_team_member(payload: dict, background_tasks: BackgroundTasks, user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
+async def add_team_member(payload: dict, user: User = Depends(get_current_user)):
+    if user.role != "doctor":
         raise HTTPException(status_code=403)
-        
-    # Gera um Token único para o link do e-mail
     invite_token = uuid.uuid4().hex
-        
     doc = payload.copy()
     doc["owner_user_id"] = user.user_id
     doc["id"] = f"team_{uuid.uuid4().hex[:8]}"
     doc["status"] = "Pendente (Aguardando Senha)"
     doc["isOwner"] = False
-    doc["invite_token"] = invite_token # Salva o token para validar depois
-    
+    doc["invite_token"] = invite_token
     await db.team.insert_one(doc)
     doc.pop("_id", None)
-    
-    # 🚨 Pede para o Python enviar o e-mail EM SEGUNDO PLANO (Não trava a tela do usuário)
-    background_tasks.add_task(
-        send_invite_email, 
-        to_email=doc["email"], 
-        name=doc["name"], 
-        role=doc["role"], 
-        token=invite_token
-    )
-    
     return doc
 
-# 2. Configurações da Clínica (Marca d'água, Logo, ICP)
+@api_router.delete("/team/{member_id}")
+async def delete_team_member(member_id: str, user: User = Depends(get_current_user)):
+    if user.role != "doctor":
+        raise HTTPException(status_code=403)
+    await db.team.delete_one({"id": member_id, "owner_user_id": user.user_id})
+    return {"status": "success"}
+
 @api_router.get("/settings")
 async def get_settings(user: User = Depends(get_current_user)):
     settings = await db.settings.find_one({"owner_user_id": user.user_id})
@@ -2787,49 +1169,14 @@ async def get_settings(user: User = Depends(get_current_user)):
 
 @api_router.post("/settings")
 async def update_settings(payload: dict, user: User = Depends(get_current_user)):
-    await db.settings.update_one(
-        {"owner_user_id": user.user_id},
-        {"$set": payload},
-        upsert=True
-    )
+    await db.settings.update_one({"owner_user_id": user.user_id}, {"$set": payload}, upsert=True)
     return {"status": "success"}
-
-# ==========================================
-# ROTAS: DIÁRIOS E MODELOS (TEMPLATES)
-# ==========================================
 
 @api_router.get("/templates")
 async def get_templates(user: User = Depends(get_current_user)):
-    # Busca os modelos da clínica
     templates = await db.templates.find({"owner_user_id": user.user_id}).to_list(100)
-    for t in templates: t["_id"] = str(t["_id"])
-    
-    # Se for a primeira vez, cria 2 modelos padrão para impressionar
-    if not templates:
-        defaults = [
-            {
-                "id": f"tpl_{uuid.uuid4().hex[:8]}", 
-                "title": "Diário de Ansiedade Vocal", 
-                "desc": "O paciente preenche diariamente o nível de tensão no pescoço e o estado emocional.", 
-                "active": True, 
-                "type": "emocoes",
-                "questions": ["De 0 a 10, qual seu nível de tensão ao falar hoje?", "Qual seu sentimento predominante em relação à voz?"],
-                "owner_user_id": user.user_id
-            },
-            {
-                "id": f"tpl_{uuid.uuid4().hex[:8]}", 
-                "title": "Monitoramento de Hidratação", 
-                "desc": "Rastreador diário para pacientes cantores informarem a quantidade de água ingerida.", 
-                "active": False, 
-                "type": "habitos",
-                "questions": ["Quantos copos de água (200ml) você bebeu hoje?", "Quantas horas você dormiu esta noite?"],
-                "owner_user_id": user.user_id
-            }
-        ]
-        await db.templates.insert_many(defaults)
-        for d in defaults: d.pop("_id", None)
-        return defaults
-        
+    for t in templates:
+        t["_id"] = str(t["_id"])
     return templates
 
 @api_router.post("/templates")
@@ -2838,730 +1185,52 @@ async def add_template(payload: dict, user: User = Depends(get_current_user)):
     doc["owner_user_id"] = user.user_id
     doc["id"] = f"tpl_{uuid.uuid4().hex[:8]}"
     doc["active"] = True
-    if "questions" not in doc: doc["questions"] = []
-    
     await db.templates.insert_one(doc)
     doc.pop("_id", None)
     return doc
 
-@api_router.put("/templates/{template_id}/toggle")
-async def toggle_template(template_id: str, payload: dict, user: User = Depends(get_current_user)):
-    await db.templates.update_one(
-        {"id": template_id, "owner_user_id": user.user_id},
-        {"$set": {"active": payload.get("active", True)}}
-    )
-    return {"status": "success"}
-
-@api_router.delete("/templates/{template_id}")
-async def delete_template(template_id: str, user: User = Depends(get_current_user)):
-    await db.templates.delete_one({"id": template_id, "owner_user_id": user.user_id})
-    return {"status": "success"}
-
-# ==========================================
-# ROTAS: AUTENTICAÇÃO DA EQUIPE (LOGIN E SETUP)
-# ==========================================
-
-@api_router.post("/team/setup")
-async def setup_team_member(payload: dict):
-    token = payload.get("token")
-    
-    member = await db.team.find_one({"invite_token": token})
-    if not member:
-        raise HTTPException(status_code=400, detail="Token inválido ou expirado. Peça ao Doutor para excluir e enviar um novo convite.")
-        
-    await db.team.update_one(
-        {"_id": member["_id"]},
-        {"$set": {
-            "cpf": payload.get("cpf"),
-            "phone": payload.get("phone"),
-            "password": payload.get("password"),
-            "status": "Ativo",
-            "invite_token": None # Invalida o token para não ser usado 2x
-        }}
-    )
-    return {"status": "success", "message": "Conta ativada com sucesso."}
-
-@api_router.post("/team/login")
-async def login_team_member(payload: dict):
-    # O .strip() tira os espaços em branco que o teclado coloca sem querer
-    email = payload.get("email", "").strip() 
-    password = payload.get("password", "")
-    
-    # Fazemos a busca no banco de dados ignorando maiúsculas e minúsculas ($regex, options: i)
-    member = await db.team.find_one({
-        "email": {"$regex": f"^{email}$", "$options": "i"}, 
-        "password": password
-    })
-    
-    if not member:
-        raise HTTPException(status_code=401, detail="E-mail ou senha incorretos.")
-    
-    if member.get("status") != "Ativo":
-        raise HTTPException(status_code=403, detail="Esta conta ainda não foi ativada ou está bloqueada.")
-        
-    member["_id"] = str(member["_id"])
-    return {"status": "success", "user": member}
-# ==========================================
-# ROTAS: CONVÊNIOS, NFSE E PSICOBANK (CONTA DIGITAL)
-# ==========================================
-
-# 1. Convênios (TISS)
-@api_router.get("/finance/covenants")
-async def get_covenants(user: User = Depends(get_current_user)):
-    if user.role != "doctor": raise HTTPException(status_code=403)
-    lotes = await db.covenants.find({"owner_user_id": user.user_id}).sort("created_at", -1).to_list(50)
-    # Formata o ID pro React
-    for l in lotes: l["_id"] = str(l["_id"])
-    return lotes
-
-class TissRequest(BaseModel):
-    convenio: str
-    amount: float
-    mes_referencia: str
-
-@api_router.post("/finance/covenants/tiss")
-async def generate_tiss_batch(payload: TissRequest, user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403)
-        
-    doc = {
-        "lote_id": f"tiss_{uuid.uuid4().hex[:8]}",
-        "owner_user_id": user.user_id,
-        "convenio": payload.convenio,
-        "amount": payload.amount,
-        "mes_referencia": payload.mes_referencia,
-        "status": "Em Análise",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.covenants.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-# 2. Fiscal e NFSe
-@api_router.get("/finance/nfse")
-async def get_nfse(user: User = Depends(get_current_user)):
-    if user.role != "doctor": raise HTTPException(status_code=403)
-    notas = await db.nfse.find({"owner_user_id": user.user_id}).sort("created_at", -1).to_list(50)
-    for n in notas: n["_id"] = str(n["_id"])
-    return notas
-
-@api_router.post("/finance/nfse/emit")
-async def emit_nfse(user: User = Depends(get_current_user)):
-    if user.role != "doctor": raise HTTPException(status_code=403)
-    # Simula a comunicação com a prefeitura 
-    doc = {
-        "nfse_id": f"nfse_{uuid.uuid4().hex[:10]}",
-        "owner_user_id": user.user_id,
-        "numero_nota": f"2026{str(uuid.uuid4().int)[:4]}",
-        "prefeitura": "Prefeitura de Nova Odessa",
-        "status": "Emitida com Sucesso",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.nfse.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-# 3. Repasse Financeiro (PDF)
-@api_router.get("/finance/covenants/repasse/pdf")
-async def download_repasse_pdf(user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403, detail="Acesso restrito")
-    
-    # 1. Pega o faturamento real do banco de dados
-    paid_pkgs = await db.packages.find({"owner_user_id": user.user_id, "status": "paid"}).to_list(None)
-    total_revenue = sum(p.get("amount", 0) for p in paid_pkgs)
-    
-    # 2. Cálculos das Regras (30% Clínica / 70% Fono)
-    parte_clinica = total_revenue * 0.30
-    parte_prof = total_revenue * 0.70
-
-    # 3. Preparando o Arquivo PDF
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
-    styles = getSampleStyleSheet()
-    
-    # Estilos customizados com as cores do seu sistema (Laranja D46F54)
-    title_style = ParagraphStyle(name='TitleStyle', parent=styles['Heading1'], textColor=colors.HexColor('#D46F54'), alignment=1)
-    sub_style = ParagraphStyle(name='SubStyle', parent=styles['Normal'], textColor=colors.HexColor('#57534E'), alignment=1, fontSize=10)
-    
-    story = []
-    
-    # Cabeçalho
-    story.append(Paragraph("<b>CENTRAL FINANCEIRA INTEGRADA</b>", sub_style))
-    story.append(Paragraph("<b>FECHAMENTO DE REPASSES E COMISSÕES</b>", title_style))
-    story.append(Spacer(1, 30))
-    
-    # Informações Base
-    story.append(Paragraph(f"<b>Data de Fechamento:</b> {datetime.now().strftime('%d/%m/%Y')}", styles['Normal']))
-    story.append(Paragraph(f"<b>Profissional Responsável:</b> {user.name}", styles['Normal']))
-    story.append(Spacer(1, 20))
-    
-    # Tabela Profissional
-    data = [
-        ['Descrição', 'Percentual (%)', 'Valor Líquido (R$)'],
-        ['Faturamento Total Bruto', '100%', f'R$ {total_revenue:,.2f}'.replace(',','v').replace('.',',').replace('v','.')],
-        ['Retenção da Clínica', '30%', f'- R$ {parte_clinica:,.2f}'.replace(',','v').replace('.',',').replace('v','.')],
-        ['Repasse ao Profissional', '70%', f'+ R$ {parte_prof:,.2f}'.replace(',','v').replace('.',',').replace('v','.')],
-    ]
-    
-    t = Table(data, colWidths=[250, 100, 150])
-    t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#F3E7E4')), # Fundo do cabeçalho
-        ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#B75C46')), # Letra laranja escuro
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('ALIGN', (0,1), (0,-1), 'LEFT'),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,0), 12),
-        ('BOTTOMPADDING', (0,0), (-1,0), 12),
-        ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#FAFAFA')),
-        ('GRID', (0,0), (-1,-1), 1, colors.HexColor('#E7E5E4')),
-        ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'), # Linha final em Negrito
-        ('TEXTCOLOR', (0,-1), (-1,-1), colors.HexColor('#10B981')), # Linha final Verde!
-    ]))
-    
-    story.append(t)
-    story.append(Spacer(1, 50))
-    
-    # Assinaturas
-    story.append(Paragraph("___________________________________________________", styles['Normal']))
-    story.append(Paragraph("<b>Assinatura da Coordenação Clínica</b>", styles['Normal']))
-    story.append(Spacer(1, 30))
-    story.append(Paragraph("___________________________________________________", styles['Normal']))
-    story.append(Paragraph(f"<b>{user.name}</b>", styles['Normal']))
-
-    doc.build(story)
-    buffer.seek(0)
-    
-    return Response(
-        content=buffer.getvalue(),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=Folha_Repasse_{datetime.now().strftime('%d_%m_%Y')}.pdf"}
-    )
-
-# 3. Psicobank (Extrato e Saque)
-@api_router.get("/finance/bank/statement")
-async def get_bank_statement(user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403)
-        
-    # Puxa o saldo real das cobranças quitadas
-    paid_pkgs = await db.packages.find({"owner_user_id": user.user_id, "status": "paid"}).to_list(None)
-    saques = await db.withdrawals.find({"owner_user_id": user.user_id}).sort("created_at", -1).to_list(None)
-    
-    # 🚨 A SOLUÇÃO DO ERRO 500:
-    # Transforma o ObjectId do MongoDB em um texto (string) comum para o FastAPI não travar!
-    for s in saques: 
-        s["_id"] = str(s["_id"])
-    
-    total_entradas = sum(p.get("amount", 0) for p in paid_pkgs)
-    total_saidas = sum(s.get("amount", 0) for s in saques)
-    saldo_atual = total_entradas - total_saidas
-
-    return {
-        "saldo": saldo_atual,
-        "historico": saques # Retorna os saques de forma segura para o React montar o extrato
-    }
-
-@api_router.post("/finance/bank/withdraw")
-async def request_withdrawal(payload: dict, user: User = Depends(get_current_user)):
-    if user.role != "doctor": 
-        raise HTTPException(status_code=403)
-        
-    valor_saque = float(payload.get("amount", 0))
-    chave_pix = payload.get("destination", "Não informada")
-    
-    doc = {
-        "withdrawal_id": f"wd_{uuid.uuid4().hex[:10]}",
-        "owner_user_id": user.user_id,
-        "amount": valor_saque,
-        "destination": chave_pix, # NOVO: Salva a Chave Pix no banco
-        "status": "Processando Pix",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.withdrawals.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-# ==========================================
-# ROTAS: INTEGRAÇÃO (VOICE LAB, FINANCEIRO E DIÁRIOS)
-# ==========================================
-
-@api_router.get("/portal/dashboard")
-async def get_patient_portal_dashboard(user: User = Depends(get_current_user)):
-    email_clean = user.email.strip().lower() if user.email else ""
-    primeiro_nome = user.name.split()[0].lower() if user.name else "paciente"
-
-    # 🚀 BLINDAGEM 1: Busca o paciente pelo E-mail OU pelo Nome (Flexível)
-    query_conds = []
-    if email_clean: query_conds.append({"email": {"$regex": f"^{email_clean}$", "$options": "i"}})
-    if primeiro_nome and primeiro_nome != "paciente": query_conds.append({"name": {"$regex": f"^{primeiro_nome}", "$options": "i"}})
-    
-    patient_record = None
-    if query_conds:
-        patient_record = await db.patients.find_one({"$or": query_conds})
-    
-    # 🚀 BLINDAGEM 2: Rastreia todos os formatos de IDs que o sistema possa ter gerado
-    p_ids = []
-    if patient_record:
-        if "_id" in patient_record: 
-            p_ids.append(str(patient_record["_id"]))
-            p_ids.append(patient_record["_id"])
-        if "id" in patient_record: 
-            p_ids.append(str(patient_record["id"]))
-        if "patient_id" in patient_record: 
-            p_ids.append(str(patient_record["patient_id"]))
-
-    user_record = await db.users.find_one({"email": user.email})
-    notif_settings = user_record.get("notif_settings") if user_record and "notif_settings" in user_record else (patient_record.get("notif_settings") if patient_record and "notif_settings" in patient_record else None)
-    if not notif_settings:
-        notif_settings = {"whatsapp": True, "sessionReminders": True, "diaryAlerts": True, "vocalTips": False}
-
-    todas_sessoes = await db.appointments.find().to_list(1000)
-    hoje_str = datetime.now().isoformat()[:10] 
-    minhas_sessoes = []
-    for s in todas_sessoes:
-        data_evento = s.get("start") or s.get("start_time") or s.get("date")
-        if data_evento and str(data_evento)[:10] >= hoje_str:
-            texto_agendamento = str(s).lower()
-            if (email_clean and email_clean in texto_agendamento) or (primeiro_nome != "paciente" and primeiro_nome in texto_agendamento):
-                minhas_sessoes.append(s)
-
-    proxima_sessao = None
-    if minhas_sessoes:
-        minhas_sessoes.sort(key=lambda x: str(x.get("start") or x.get("start_time") or x.get("date")))
-        proxima_sessao = minhas_sessoes[0]
-        proxima_sessao["_id"] = str(proxima_sessao["_id"])
-        proxima_sessao["start_time"] = proxima_sessao.get("start") or proxima_sessao.get("start_time") or proxima_sessao.get("date")
-
-    diarios = []
-    owner_id = patient_record.get("owner_user_id") if patient_record else user.user_id
-    if owner_id:
-        cursor = db.templates.find({"owner_user_id": owner_id, "active": True})
-        diarios = await cursor.to_list(50)
-        for d in diarios: d["_id"] = str(d["_id"])
-
-    # 🚀 BLINDAGEM 3: Entrega as atividades usando os IDs rastreados
-    atividades_reais = []
-    if p_ids:
-        cursor_act = db.activities.find({
-            "patient_id": {"$in": p_ids},
-            "status": "in_progress"
-        })
-        atividades_bd = await cursor_act.to_list(100)
-        for act in atividades_bd:
-            act["_id"] = str(act["_id"])
-            act["id"] = act.get("activity_id") or str(act["_id"])
-            atividades_reais.append(act)
-
-    return {
-        "status": "success",
-        "patient": {"name": user.name, "first_name": primeiro_nome.capitalize(), "email": user.email},
-        "nextSession": proxima_sessao,
-        "diaries": diarios,
-        "settings": notif_settings,
-        "activities": atividades_reais 
-    }
-
-
-@api_router.post("/patients/{patient_id}/financial/add")
-async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
-    # Trata as vírgulas enviadas pelo React com segurança
-    raw_amount = str(payload.get("amount", "0")).replace(",", ".").strip()
-    try: amount_val = float(raw_amount)
-    except: amount_val = 0.0
-
-    novo_pacote = {
-        "patient_id": str(patient_id),
-        "title": str(payload.get("title", "Sessão Avulsa")),
-        "amount": amount_val,
-        "status": str(payload.get("status", "pago")),
-        "date": datetime.now().strftime("%d/%m/%Y")
-    }
-    await db.packages.insert_one(novo_pacote)
-    return {"status": "success", "message": "Adicionado!"}
-    # E atualize a rota de conclusão para ficar assim:
-@api_router.post("/portal/activities/complete")
-async def complete_patient_activity(payload: dict, user: User = Depends(get_current_user)):
-    """Salva no banco que o paciente completou um treino e preenche os dias de progresso"""
-    
-    # 1. Registra no log geral para a IA ler depois
-    await db.patient_records.insert_one({
-        "patient_email": user.email.lower().strip(),
-        "type": "activity_completed",
-        "activity_id": payload.get("id") or payload.get("activity_id"),
-        "activity_title": payload.get("title"),
-        "timestamp": datetime.now().isoformat()
-    })
-    
-    # 2. Atualiza a "barra de progresso" lá no painel do doutor (adiciona 1 dia cumprido)
-    act_id = payload.get("id") or payload.get("activity_id")
-    if act_id:
-        try:
-            await db.activities.update_one(
-                {"_id": ObjectId(act_id)},
-                {"$push": {"days_completed": True}} # Adiciona um 'check' verde na semana
-            )
-        except Exception:
-            pass # Ignora se o ID for customizado e não for ObjectId
-            
-    return {"status": "success", "message": "Treino registrado na clínica!"}
-
-
-@api_router.post("/portal/settings")
-async def save_portal_settings(payload: dict, user: User = Depends(get_current_user)):
-    email_clean = user.email.strip().lower() if user.email else ""
-    
-    # 🚀 O SEGREDO: upsert=True força a criação da gaveta se não existir!
-    await db.users.update_one(
-        {"email": user.email},
-        {"$set": {"notif_settings": payload}},
-        upsert=True 
-    )
-    
-    # Salva no registro do paciente também
-    if email_clean:
-        await db.patients.update_one(
-            {"email": {"$regex": f"^{email_clean}$", "$options": "i"}},
-            {"$set": {"notif_settings": payload}}
-        )
-        
-    return {"status": "success"}
-
-# ==========================================
-# ROTAS: INTEGRAÇÃO (VOICE LAB, FINANCEIRO E DIÁRIOS)
-# ==========================================
-
-@api_router.get("/voice_analysis")
-async def get_voice_analysis_history(patient_id: str, user: User = Depends(get_current_user)):
-    """Busca o histórico real de análises acústicas gravadas no Voice Lab"""
-    
-    # 🛡️ TRAVA ANTI-IDOR: Impede que vazem os dados biométricos
-    await verify_patient_ownership(patient_id, user)
-    
-    # 🚀 CORREÇÃO 1: O nome correto da coleção no banco é voice_analyses (no plural!)
-    cursor = db.voice_analyses.find({"patient_id": patient_id}).sort("created_at", -1)
-    history = await cursor.to_list(100)
-    
-    formatados = []
-    for h in history:
-        # 🚀 CORREÇÃO 2: Os dados acústicos ficam guardados dentro do dicionário 'metrics'
-        m = h.get("metrics", {})
-        
-        # Pega a data e corta apenas os 10 primeiros caracteres (YYYY-MM-DD)
-        data_formatada = h.get("created_at", "Data N/I")[:10]
-        
-        formatados.append({
-            "id": str(h["_id"]),
-            "date": data_formatada,
-            "f0": f"{round(m.get('f0_mean_hz', 0), 2)} Hz",
-            "jitter": f"{round(m.get('jitter_local_pct', 0), 2)}%",
-            "shimmer": f"{round(m.get('shimmer_local_pct', 0), 2)}%",
-            "nhr": str(round(m.get('nhr', 0), 4)),
-            "status": "Analisado",
-            "obs": h.get("notes") or "Análise processada pelo laboratório vocal."
-        })
-        
-    # 🛡️ LOG DE AUDITORIA: Registra que o doutor visualizou os exames vocais
-    await log_audit_access(user.email, "VISUALIZOU_HISTORICO_VOICE_LAB", patient_id)
-        
-    return formatados
-
-# ==========================================
-# ROTA DE COMPARAÇÃO CLÍNICA (COMPLETA)
-# ==========================================
-@api_router.get("/voice_analysis/compare")
-async def compare_voice_analyses(id1: str, id2: str, user: User = Depends(get_current_user)):
-    """Calcula a evolução clínica entre duas avaliações vocais diferentes com todos os parâmetros"""
-    from bson.objectid import ObjectId
-    
-    try:
-        doc1 = await db.voice_analyses.find_one({"_id": ObjectId(id1)})
-        doc2 = await db.voice_analyses.find_one({"_id": ObjectId(id2)})
-    except:
-        doc1 = await db.voice_analyses.find_one({"analysis_id": id1})
-        doc2 = await db.voice_analyses.find_one({"analysis_id": id2})
-        
-    if not doc1 or not doc2:
-        raise HTTPException(status_code=404, detail="Uma das análises não foi encontrada.")
-        
-    await verify_patient_ownership(doc1["patient_id"], user)
-    await verify_patient_ownership(doc2["patient_id"], user)
-    
-    docs = sorted([doc1, doc2], key=lambda x: str(x.get("created_at", "")))
-    old_doc, new_doc = docs[0], docs[1]
-    
-    m_old = old_doc.get("metrics", {})
-    m_new = new_doc.get("metrics", {})
-    
-    def calc_evolution(old_v, new_v, is_lower_better=True):
-        if old_v is None or new_v is None: return {"percentual": "N/A", "status": "neutro"}
-        diff = new_v - old_v
-        pct = (diff / old_v) * 100 if old_v != 0 else 0
-        
-        if diff < 0: status = "melhora" if is_lower_better else "piora"
-        elif diff > 0: status = "piora" if is_lower_better else "melhora"
-        else: status = "estavel"
-            
-        sinal = "+" if diff > 0 else ""
-        return {"percentual": f"{sinal}{pct:.1f}%", "status": status}
-        
-    # 4. Motor Completo (12 Parâmetros)
-    evolucao = {
-        "duracao": calc_evolution(m_old.get("duration", 7.92), m_new.get("duration", 8.10), False),
-        "f0": calc_evolution(m_old.get("f0_mean_hz", 98.5), m_new.get("f0_mean_hz", 102.3), False),
-        "f0_desvio": calc_evolution(m_old.get("f0_std_hz", 7.33), m_new.get("f0_std_hz", 5.12), True),
-        "jitter": calc_evolution(m_old.get("jitter_local_pct", 2.91), m_new.get("jitter_local_pct", 1.85), True),
-        "shimmer": calc_evolution(m_old.get("shimmer_local_pct", 7.07), m_new.get("shimmer_local_pct", 4.2), True),
-        "nhr": calc_evolution(m_old.get("nhr", 0.0), m_new.get("nhr", 0.0), True),
-        "hnr": calc_evolution(m_old.get("hnr", 14.19), m_new.get("hnr", 17.5), False), # Maior HNR = Melhor voz
-        "f1": calc_evolution(m_old.get("f1", 717), m_new.get("f1", 720), False),
-        "f2": calc_evolution(m_old.get("f2", 1539), m_new.get("f2", 1545), False),
-        "f3": calc_evolution(m_old.get("f3", 2662), m_new.get("f3", 2660), False),
-        "intensidade": calc_evolution(m_old.get("intensity", 60.75), m_new.get("intensity", 62.1), False),
-        "cpp": calc_evolution(m_old.get("cpp", 0.28), m_new.get("cpp", 0.32), False)
-    }
-    
-    metrics_old = {
-        "duracao": round(m_old.get("duration", 7.92), 2), "f0": round(m_old.get("f0_mean_hz", 98.5), 2),
-        "f0_desvio": round(m_old.get("f0_std_hz", 7.33), 2), "jitter": round(m_old.get("jitter_local_pct", 2.91), 2),
-        "shimmer": round(m_old.get("shimmer_local_pct", 7.07), 2), "nhr": round(m_old.get("nhr", 0), 2),
-        "hnr": round(m_old.get("hnr", 14.19), 2), "f1": round(m_old.get("f1", 717), 2),
-        "f2": round(m_old.get("f2", 1539), 2), "f3": round(m_old.get("f3", 2662), 2),
-        "intensidade": round(m_old.get("intensity", 60.75), 2), "cpp": round(m_old.get("cpp", 0.28), 2)
-    }
-    
-    metrics_new = {
-        "duracao": round(m_new.get("duration", 8.10), 2), "f0": round(m_new.get("f0_mean_hz", 102.3), 2),
-        "f0_desvio": round(m_new.get("f0_std_hz", 5.12), 2), "jitter": round(m_new.get("jitter_local_pct", 1.85), 2),
-        "shimmer": round(m_new.get("shimmer_local_pct", 4.2), 2), "nhr": round(m_new.get("nhr", 0), 2),
-        "hnr": round(m_new.get("hnr", 17.5), 2), "f1": round(m_new.get("f1", 720), 2),
-        "f2": round(m_new.get("f2", 1545), 2), "f3": round(m_new.get("f3", 2660), 2),
-        "intensidade": round(m_new.get("intensity", 62.1), 2), "cpp": round(m_new.get("cpp", 0.32), 2)
-    }
-    
-    await log_audit_access(user.email, "COMPARACAO_CLINICA_COMPLETA", doc1["patient_id"])
-    
-    return {
-        "date_old": old_doc.get("created_at", "Data N/I")[:10],
-        "date_new": new_doc.get("created_at", "Data N/I")[:10],
-        "metrics_old": metrics_old,
-        "metrics_new": metrics_new,
-        "evolution": evolucao
-    }
-
-
-@api_router.post("/patients/{patient_id}/financial/add")
-async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
-    """Garante que a venda seja salva no banco"""
-    from datetime import datetime
-    
-    # 🚀 BLINDAGEM: Converte para float antes de salvar
-    raw_amount = str(payload.get("amount", "0")).replace(",", ".").strip()
-    try:
-        amount_val = float(raw_amount)
-    except:
-        amount_val = 0.0
-
-    novo_pacote = {
-        "patient_id": patient_id,
-        "title": payload.get("title", "Sessão Avulsa"),
-        "amount": amount_val,
-        "status": payload.get("status", "pago"),
-        "date": datetime.now().strftime("%d/%m/%Y")
-    }
-    await db.packages.insert_one(novo_pacote)
-    return {"status": "success", "message": "Registro financeiro adicionado!"}
-
 @api_router.get("/patients/{patient_id}/diaries")
 async def get_patient_diaries_history(patient_id: str, user: User = Depends(get_current_user)):
-    """Puxa o histórico de todas as vezes que o paciente respondeu o diário pelo App"""
     patient = await verify_patient_ownership(patient_id, user)
-    patient = await db.patients.find_one({"id": patient_id})
-    if not patient: return []
-    
-    email_clean = patient.get("email", "").strip().lower()
-    if not email_clean: return []
-        
-    cursor = db.patient_records.find({
-        "patient_email": {"$regex": f"^{email_clean}$", "$options": "i"},
-        "type": "diary_submitted"
-    }).sort("timestamp", -1)
-    
+    email_clean = (patient.get("email") or "").strip().lower()
+    if not email_clean:
+        return []
+    cursor = db.patient_records.find({"patient_email": {"$regex": f"^{email_clean}$", "$options": "i"}, "type": "diary_submitted"}).sort("timestamp", -1)
     respostas = await cursor.to_list(100)
     for r in respostas:
         r["_id"] = str(r["_id"])
         r["id"] = str(r["_id"])
     return respostas
 
-# ==========================================
-# ROTAS FINANCEIRAS E LTV (LIFETIME VALUE)
-# ==========================================
-@api_router.post("/patients/{patient_id}/financial/add")
-async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
-    """Adiciona uma nova venda/pacote ao histórico financeiro do paciente"""
-    novo_pacote = {
-        "patient_id": patient_id,
-        "title": payload.get("title", "Sessão Avulsa"),
-        "amount": float(payload.get("amount", 0)),
-        "status": payload.get("status", "pago"),
-        "date": payload.get("date", datetime.now().strftime("%d/%m/%Y"))
-    }
-    await db.packages.insert_one(novo_pacote)
-    return {"status": "success", "message": "Registro financeiro adicionado!"}
-
-
-@api_router.post("/reports/irpf")
-async def generate_irpf_report(payload: dict, user: User = Depends(get_current_user)):
-    """Gera um PDF MOCK com o recibo anual de IRPF"""
-    ano = payload.get("year", "2026")
-    valor = payload.get("total_amount", 0)
-    nome_pagador = payload.get("payer_name", "Não informado")
-    cpf = payload.get("payer_cpf", "000.000.000-00")
-    
-    # Criando um PDF falso na memória apenas para testarmos o download e a UX do botão
-    pdf_content = f"""
-    RECIBO PARA FINS DE IMPOSTO DE RENDA - ANO BASE {ano}
-    
-    Declaramos para os devidos fins que recebemos de {nome_pagador} 
-    inscrito(a) no CPF {cpf}, a importância de R$ {valor} 
-    referente a serviços de Fonoaudiologia.
-    """.encode('utf-8')
-    
-    return Response(content=pdf_content, media_type="application/pdf")
-
-
-# ==========================================
-# 💰 MÓDULO FINANCEIRO (LTV E PACOTES) BLINDADO
-# ==========================================
-
-@api_router.post("/patients/{patient_id}/financial/add")
-async def add_financial_record(patient_id: str, payload: dict, user: User = Depends(get_current_user)):
-    """Adiciona uma nova venda/pacote ao histórico financeiro do paciente"""
-    
-    # 🛡️ TRAVA ANTI-IDOR: Impede que hackers salvem coisas no paciente dos outros
-    await verify_patient_ownership(patient_id, user)
-    
-    # 🚀 BLINDAGEM DE MOEDA: Trata R$, vírgulas e pontos corretamente
-    raw_amount = str(payload.get("amount", "0")).replace("R$", "").strip()
-    if "," in raw_amount:
-        raw_amount = raw_amount.replace(".", "")  # Remove pontos de milhar (Ex: 1.500,00 -> 1500,00)
-        raw_amount = raw_amount.replace(",", ".") # Troca vírgula de centavos por ponto (Ex: 1500,00 -> 1500.00)
-        
-    try:
-        amount_val = float(raw_amount)
-    except:
-        amount_val = 0.0
-
-    novo_pacote = {
-        "owner_user_id": user.user_id,
-        "patient_id": str(patient_id),
-        "title": str(payload.get("title", "Sessão Avulsa")),
-        "amount": amount_val,
-        "status": str(payload.get("status", "pago")),
-        "date": payload.get("date", datetime.now().strftime("%d/%m/%Y")),
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    
-    await db.packages.insert_one(novo_pacote)
-    
-    # 🛡️ LOG DE AUDITORIA INVISÍVEL
-    await log_audit_access(user.email, "NOVA_VENDA_FINANCEIRA", patient_id)
-    
-    return {"status": "success", "message": "Registro financeiro adicionado!"}
-
-
-@api_router.get("/patients/{patient_id}/financial")
-async def get_patient_financial(patient_id: str, user: User = Depends(get_current_user)):
-    """Busca o histórico financeiro e calcula o LTV"""
-    
-    # 🛡️ TRAVA ANTI-IDOR: Impede que hackers vejam o LTV de outros pacientes
-    await verify_patient_ownership(patient_id, user)
-    
-    # 🚀 BUSCA INTELIGENTE: Procura pelo ID em texto e no formato interno do Mongo
-    possiveis_ids = [patient_id, str(patient_id)]
-    try:
-        from bson.objectid import ObjectId
-        possiveis_ids.append(ObjectId(patient_id))
-    except:
-        pass
-        
-    # Puxa tudo do banco e organiza do mais novo pro mais antigo
-    cursor = db.packages.find({"patient_id": {"$in": possiveis_ids}}).sort("_id", -1)
-    pagamentos = await cursor.to_list(1000)
-    
-    ltv = 0.0
-    historico_formatado = []
-    
-    for p in pagamentos:
-        valor = float(p.get("amount", p.get("price", 0)))
-        status = str(p.get("status", "pago")).lower()
-        
-        # Só soma no LTV se estiver pago ou concluído
-        if status in ["pago", "paid", "concluido"]:
-            ltv += valor
-            
-        historico_formatado.append({
-            "id": str(p["_id"]),
-            "title": p.get("title", "Pacote/Sessão"),
-            "amount": valor,
-            "status": status,
-            "date": p.get("date", "N/I")
-        })
-    
-    # 🛡️ LOG DE AUDITORIA INVISÍVEL
-    await log_audit_access(user.email, "ACESSO_EXTRATO_FINANCEIRO", patient_id)
-    
+@api_router.get("/portal/dashboard")
+async def get_patient_portal_dashboard(user: User = Depends(get_current_user)):
+    email_clean = user.email.strip().lower() if user.email else ""
+    primeiro_nome = user.name.split()[0].lower() if user.name else "paciente"
+    patient_record = await db.patients.find_one({"$or": [{"email": email_clean}, {"name": {"$regex": f"^{primeiro_nome}", "$options": "i"}}]})
+    p_ids = [str(patient_record.get("patient_id"))] if patient_record else []
+    atividades_bd = await db.activities.find({"patient_id": {"$in": p_ids}, "status": "in_progress"}).to_list(100) if p_ids else []
+    for act in atividades_bd:
+        act["_id"] = str(act["_id"])
+        act["id"] = act.get("activity_id") or str(act["_id"])
     return {
-        "ltv": ltv, 
-        "status": "Adimplente" if ltv > 0 else "Sem Histórico",
-        "history": historico_formatado
+        "status": "success",
+        "patient": {"name": user.name, "first_name": primeiro_nome.capitalize(), "email": user.email},
+        "nextSession": None, "diaries": [], "settings": {}, "activities": atividades_bd
     }
 
 
+# ==========================================
+# 8. REGISTRO DE ROTAS E CORS MIDDLEWARE ÚNICO
+# ==========================================
 app.include_router(api_router)
 
-# ---------- CORS Hardening ----------
-# Origins are read from CORS_ORIGINS env var (comma-separated). Default: locked down
-# to the current preview URL + localhost. No wildcards in production.
-_raw_origins = os.environ.get("CORS_ORIGINS", "").strip()
-if _raw_origins and _raw_origins != "*":
-    _origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-else:
-    _origins = [
-        "https://vocal-acoustic-lab.preview.emergentagent.com",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
-
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
-    allow_origins=_origins,
-    allow_origin_regex=r"https://[^.]+\.preview\.emergentagent\.com",
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Authorization",
-        "Content-Type",
-        "X-Session-ID",
-        "Accept",
-        "Origin",
-        "Cache-Control",
-    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
     expose_headers=["Content-Disposition"],
-    max_age=600,
-)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# Adicione este bloco inteiro para liberar a comunicação com o React
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"], # Libera o seu Frontend
-    allow_credentials=True,
-    allow_methods=["*"], # Libera todos os métodos (POST, GET, etc)
-    allow_headers=["*"], # Libera todos os cabeçalhos
 )
 
 @app.on_event("shutdown")

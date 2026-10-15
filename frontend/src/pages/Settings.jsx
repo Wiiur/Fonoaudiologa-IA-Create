@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import FinancialVault from "./FinancialVault";
 
 // Importação de Ícones
 import { 
@@ -230,6 +231,7 @@ export default function SettingsPage() {
           { id: "signatures", label: "Assinaturas (A1/Digital)", icon: FileSignature },
           { id: "team", label: "Equipe & Secretárias", icon: Users },
           { id: "templates", label: "Diários & Modelos", icon: BookHeart },
+          { id: "finance", label: "Cofre & Recebimentos", icon: Lock }, // <--- NOVA ABA AQUI
         ].map((tab) => (
           <button 
             key={tab.id} onClick={() => setActiveTab(tab.id)} 
@@ -652,8 +654,19 @@ export default function SettingsPage() {
                   </div>
                 </DialogContent>
               </Dialog>
+              
 
             </div>
+            
+
+          </div>
+        )}
+        {/* ========================================== */}
+        {/* ABA 5: COFRE FINANCEIRO (CASH-OUT E API)   */}
+        {/* ========================================== */}
+        {activeTab === "finance" && (
+          <div className="animate-in fade-in slide-in-from-bottom-4">
+             <FinancialVault />
           </div>
         )}
 

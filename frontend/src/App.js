@@ -12,9 +12,6 @@ import Dashboard from "@/pages/Dashboard";
 import Patients from "@/pages/Patients";
 import PatientDetail from "@/pages/PatientDetail";
 import Agenda from "@/pages/Agenda";
-import Activities from "@/pages/Activities";
-import Prontuario from "@/pages/Prontuario";
-import Reports from "@/pages/Reports";
 import Copilot from "@/pages/Copilot";
 import VoiceLab from "@/pages/VoiceLab";
 import VoiceChallenges from "@/pages/VoiceChallenges";
@@ -106,9 +103,7 @@ const AppRouter = () => {
         <Route path="/patients/:id" element={<Protected permissionRequired="agenda"><PatientDetail /></Protected>} />
 
         {/* PERMISSÃO: CLÍNICO (Acesso a Prontuários SOAP, Laudos e Exercícios) */}
-        <Route path="/activities" element={<Protected permissionRequired="clinical"><Activities /></Protected>} />
-        <Route path="/prontuario" element={<Protected permissionRequired="clinical"><Prontuario /></Protected>} />
-        <Route path="/reports" element={<Protected permissionRequired="clinical"><Reports /></Protected>} />
+        
         <Route path="/copilot" element={<Protected permissionRequired="clinical"><Copilot /></Protected>} />
         <Route path="/voice-lab" element={<Protected permissionRequired="clinical"><VoiceLab /></Protected>} />
         <Route path="/voice-challenges" element={<Protected permissionRequired="clinical"><VoiceChallenges /></Protected>} />
