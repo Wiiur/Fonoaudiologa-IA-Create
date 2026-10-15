@@ -287,58 +287,56 @@ export default function VoiceLab() {
     toast.success("Análise removida");
   };
 
-  // Motor do Espectrograma em Tempo Real (Aba Científica)
-  useEffect(() => {
-    if (viewMode !== "scientific" || !secureAudioUrl) return;
-    const audioEl = document.getElementById("lab-audio-player");
-    const canvas = document.getElementById("spectro-canvas");
-    if (!audioEl || !canvas) return;
+useEffect(() => {
+  if (viewMode !== "scientific" || !secureAudioUrl) return;
+  const audioEl = document.getElementById("lab-audio-player");
+  const canvas = document.getElementById("spectro-canvas");
+  if (!audioEl || !canvas) return;
 
-    const ctx = canvas.getContext("2d");
-    let audioCtx = window.spectroAudioCtx;
-    let analyser = window.spectroAnalyser;
-    let source = window.spectroSource;
-    let animationId;
+  const ctx = canvas.getContext("2d");
+  if (!window._audioNodesMap) window._audioNodesMap = new WeakMap();
 
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 512;
-      source = audioCtx.createMediaElementSource(audioEl);
-      source.connect(analyser);
-      analyser.connect(audioCtx.destination);
-      window.spectroAudioCtx = audioCtx;
-      window.spectroAnalyser = analyser;
-      window.spectroSource = source;
+  let nodeData = window._audioNodesMap.get(audioEl);
+  if (!nodeData) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioCtx();
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    const source = audioCtx.createMediaElementSource(audioEl);
+    source.connect(analyser);
+    analyser.connect(audioCtx.destination);
+    nodeData = { audioCtx, analyser };
+    window._audioNodesMap.set(audioEl, nodeData);
+  }
+
+  const { analyser } = nodeData;
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+  let animationId;
+
+  const draw = () => {
+    animationId = requestAnimationFrame(draw);
+    canvas.width = canvas.offsetWidth;
+    canvas.height = canvas.offsetHeight;
+    analyser.getByteFrequencyData(dataArray);
+    ctx.fillStyle = "#1A1817";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const barWidth = (canvas.width / bufferLength) * 2.5;
+    let x = 0;
+    for (let i = 0; i < bufferLength; i++) {
+      const barHeight = (dataArray[i] / 255) * canvas.height;
+      const r = barHeight + 25 * (i / bufferLength);
+      const g = 100 * (i / bufferLength);
+      const b = 250 - barHeight;
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+      x += barWidth + 1;
     }
-
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
-    const draw = () => {
-      animationId = requestAnimationFrame(draw);
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
-      analyser.getByteFrequencyData(dataArray);
-
-      ctx.fillStyle = "#1A1817"; 
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      const barWidth = (canvas.width / bufferLength) * 2.5;
-      let x = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        const barHeight = (dataArray[i] / 255) * canvas.height;
-        const r = barHeight + (25 * (i / bufferLength));
-        const g = 100 * (i / bufferLength);
-        const b = 250 - barHeight;
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
-        x += barWidth + 1;
-      }
-    };
-    draw();
-    return () => cancelAnimationFrame(animationId);
-  }, [viewMode, secureAudioUrl]);
+  };
+  draw();
+  return () => cancelAnimationFrame(animationId);
+}, [viewMode, secureAudioUrl]);
 
 // ============================================================================
   // RENDERIZADOR CLÍNICO DE ALTA FIDELIDADE (MATEMÁTICA CORRIGIDA E AUTO-ZOOM)
@@ -441,7 +439,7 @@ export default function VoiceLab() {
       
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4">
         <div>
-          <Link to={`/patient/${selectedPatient || ''}`} className="flex items-center gap-2 text-stone-500 hover:text-[#B75C46] font-semibold transition-colors w-fit mb-2">
+          <Link to={selectedPatient ? `/patients/${selectedPatient}` : "/patients"} className="flex items-center gap-2 text-stone-500 hover:text-[#B75C46] font-semibold transition-colors w-fit mb-2">
             <ArrowLeft size={16} /> Voltar ao Prontuário
           </Link>
           <h1 className="font-heading text-2xl sm:text-3xl font-bold tracking-tight text-stone-800 flex items-center gap-2">

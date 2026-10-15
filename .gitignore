@@ -86,3 +86,11 @@ android-sdk/
 credentials.json
 *.key
 .credentials
+
+# Ignore environment files
+.env
+__pycache__/
+node_modules/
+backend/uploads/
+backend/storage_data/
+build/

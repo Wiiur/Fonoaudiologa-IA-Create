@@ -33,7 +33,6 @@ export default function FinancialCenter() {
   const [openTiss, setOpenTiss] = useState(false);
   const [openNfse, setOpenNfse] = useState(false); 
   
-  // ESTADOS DO BANCO
   const [saqueAmount, setSaqueAmount] = useState("");
   const [saqueDestination, setSaqueDestination] = useState("");
   
@@ -46,23 +45,27 @@ export default function FinancialCenter() {
   const { data: covenants = [] } = useQuery({ queryKey: ["covenants"], queryFn: async () => (await api.get("/finance/covenants")).data });
   const { data: nfseList = [] } = useQuery({ queryKey: ["nfse"], queryFn: async () => (await api.get("/finance/nfse")).data });
   
-  // Busca o Saldo na Rota Nova
-  const { data: balanceData, isLoading: isBankLoading } = useQuery({ queryKey: ['finance_balance'], queryFn: async () => (await api.get('/finance/balance')).data });
+  const { data: balanceData } = useQuery({ queryKey: ['finance_balance'], queryFn: async () => (await api.get('/finance/balance')).data });
   const { data: withdrawalsHistory = [] } = useQuery({ queryKey: ['withdrawals_history'], queryFn: async () => (await api.get('/finance/bank/statement')).data.historico || [] });
   const { data: vaultConfig } = useQuery({ queryKey: ['vault_config'], queryFn: async () => (await api.get('/finance/vault')).data });
-  
-  // Busca a lista de pacotes/cobranças para a aba "Controle de Mensalidades"
   const { data: packages = [] } = useQuery({ queryKey: ["packages"], queryFn: async () => (await api.get("/packages")).data });
+
+  // Helper para atualizar todas as queries financeiras simultaneamente
+  const refreshAllFinance = () => {
+    qc.invalidateQueries({ queryKey: ["packages"] });
+    qc.invalidateQueries({ queryKey: ["finance_dashboard"] });
+    qc.invalidateQueries({ queryKey: ["finance_balance"] });
+    qc.invalidateQueries({ queryKey: ["withdrawals_history"] });
+  };
 
   const markAsPaidManual = useMutation({
     mutationFn: async (pkgId) => (await api.put(`/packages/${pkgId}/pay`)).data,
     onSuccess: () => {
       toast.success("Baixa manual realizada! O sistema já contabilizou este valor como Receita.");
-      qc.invalidateQueries({ queryKey: ["packages", "finance_dashboard", "finance_balance"] });
+      refreshAllFinance();
     }
   });
 
-  // Função para sincronizar pagamentos Pix direto com o Asaas (Teste em Localhost)
   const syncPixPayments = useMutation({
     mutationFn: async () => (await api.post("/finance/pix/sync")).data,
     onSuccess: (data) => {
@@ -71,19 +74,19 @@ export default function FinancialCenter() {
       } else {
         toast.info("Nenhuma nova confirmação de Pix encontrada no banco ainda.");
       }
-      qc.invalidateQueries({ queryKey: ["packages", "finance_dashboard", "finance_balance"] });
+      refreshAllFinance();
     },
     onError: (err) => {
       toast.error(err.response?.data?.detail || "Erro ao sincronizar com o banco Asaas.");
     }
   });
 
-
   const createExpense = useMutation({
     mutationFn: async () => (await api.post("/finance/expenses", { ...expenseForm, amount: Number(expenseForm.amount) })).data,
     onSuccess: () => {
       toast.success("Despesa registrada no painel!");
-      qc.invalidateQueries({ queryKey: ["finance_dashboard"] });
+      setExpenseForm({ description: "", amount: "", due_date: new Date().toISOString().split('T')[0] });
+      refreshAllFinance();
       setOpenExpense(false);
     },
   });
@@ -121,10 +124,10 @@ export default function FinancialCenter() {
   });
 
   const requestWithdrawal = useMutation({
-    mutationFn: async () => (await api.post("/finance/bank/withdraw", { amount: Number(saqueAmount), destination: saqueDestination })).data,
+    mutationFn: async () => (await api.post("/finance/bank/withdraw", { amount: Number(saqueAmount.toString().replace(',', '.')), destination: saqueDestination })).data,
     onSuccess: () => { 
-      toast.success("Saque solicitado! O valor cairá na sua conta em breve."); 
-      qc.invalidateQueries({ queryKey: ["finance_balance", "withdrawals_history"] }); 
+      toast.success("Saque realizado! O valor foi transferido para sua chave PIX."); 
+      refreshAllFinance();
       setSaqueAmount(""); 
       setSaqueDestination(""); 
     },
@@ -135,7 +138,7 @@ export default function FinancialCenter() {
 
   const handleWithdraw = (e) => {
     e.preventDefault();
-    const amount = parseFloat(saqueAmount.replace(',', '.'));
+    const amount = parseFloat(saqueAmount.toString().replace(',', '.'));
     
     if (isNaN(amount) || amount <= 0) return toast.error('Insira um valor válido.');
     if (amount > (balanceData?.available_balance || 0)) return toast.error('Saldo insuficiente para este saque.');
@@ -186,13 +189,13 @@ export default function FinancialCenter() {
       link.click();
       link.remove();
       toast.success("PDF de Fechamento baixado com sucesso!");
-    } catch (e) {
+    } catch {
       toast.error("Erro ao gerar o PDF de Repasse. Verifique a conexão com o servidor.");
     }
   };
 
   const handleDownloadDMED = async () => {
-    toast.info("A IA está varrendo os pagamentos e montando o arquivo DMED...");
+    toast.info("Varrendo pagamentos e montando arquivo DMED...");
     try {
       const response = await api.get('/finance/dmed/export', { responseType: 'blob' });
       const url = window.URL.createObjectURL(new Blob([response.data]));
@@ -203,7 +206,7 @@ export default function FinancialCenter() {
       link.click();
       link.remove();
       toast.success("Lote fiscal exportado com sucesso! Envie o arquivo gerado para o seu contador.");
-    } catch (e) {
+    } catch {
       toast.error("Erro ao processar dados da Receita.");
     }
   };
@@ -295,31 +298,31 @@ export default function FinancialCenter() {
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <div className="bg-white rounded-3xl p-6 border border-stone-200 shadow-sm h-72 flex flex-col overflow-hidden">
-              <h3 className="font-bold text-stone-800 mb-4 flex items-center gap-2"><BarChart size={18} className="text-[#D46F54]"/> Faturamento Anual (Recebido)</h3>
-              <div className="flex-1 flex items-end gap-1.5 sm:gap-3 justify-between pt-4 border-b border-stone-100 pb-2">
-                {monthlyData.slice(0, 8).map((val, i) => {
+              <h3 className="font-bold text-stone-800 mb-4 flex items-center gap-2"><BarChart size={18} className="text-[#D46F54]"/> Faturamento Anual (12 Meses)</h3>
+              <div className="flex-1 flex items-end gap-1.5 sm:gap-2.5 justify-between pt-4 border-b border-stone-100 pb-2">
+                {monthlyData.map((val, i) => {
                   const heightPct = (val / maxRevenue) * 100;
                   return (
-                    <div key={i} className="w-full bg-emerald-100 rounded-t-md relative group hover:bg-emerald-200 transition-colors" style={{ height: `${heightPct}%`, minHeight: '4px' }}>
-                      <div className="absolute -top-7 left-1/2 -translate-x-1/2 text-[10px] font-bold text-stone-500 bg-white border border-stone-200 px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-10 shadow-sm">
-                        R$ {val.toFixed(0)}
+                    <div key={i} className="w-full bg-emerald-100 rounded-t-md relative group hover:bg-emerald-300 transition-colors" style={{ height: `${heightPct}%`, minHeight: '6px' }}>
+                      <div className="absolute -top-7 left-1/2 -translate-x-1/2 text-[10px] font-bold text-stone-600 bg-white border border-stone-200 px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-10 shadow-sm">
+                        R$ {Number(val).toFixed(0)}
                       </div>
                     </div>
                   )
                 })}
               </div>
               <div className="flex justify-between mt-2 text-[9px] sm:text-[10px] font-bold text-stone-400 uppercase">
-                {monthLabels.slice(0, 8).map(m => <span key={m}>{m}</span>)}
+                {monthLabels.map(m => <span key={m}>{m}</span>)}
               </div>
             </div>
             
             <div className="bg-white rounded-3xl p-6 border border-stone-200 shadow-sm flex flex-col h-72">
               <h3 className="font-bold text-stone-800 mb-4 flex items-center gap-2 shrink-0"><FileSpreadsheet size={18} className="text-[#D46F54]"/> Contas a Receber vs Pagar</h3>
               <div className="space-y-3 flex-1 overflow-y-auto custom-scrollbar pr-2">
-                {dashboardData?.transactions?.length === 0 ? (
+                {!dashboardData?.transactions || dashboardData.transactions.length === 0 ? (
                   <div className="text-center text-sm text-stone-400 italic py-8">Nenhuma movimentação pendente.</div>
                 ) : (
-                  dashboardData?.transactions?.map((t, idx) => (
+                  dashboardData.transactions.map((t, idx) => (
                     <div key={idx} className="flex justify-between items-center p-3 border border-stone-100 rounded-xl bg-stone-50 hover:bg-stone-100 transition-colors">
                       <div className="overflow-hidden pr-3">
                         <p className="font-bold text-sm text-stone-700 truncate">{t.title}</p>
@@ -373,7 +376,7 @@ export default function FinancialCenter() {
             
             {packages.map((p) => {
               const isPaid = p.status === "paid";
-              const patientName = patients.find(pat => pat.patient_id === p.patient_id)?.name || "Paciente Avulso";
+              const patientName = patients.find(pat => pat.patient_id === p.patient_id)?.name || p.patient_name || "Paciente Avulso";
               const patientPhone = patients.find(pat => pat.patient_id === p.patient_id)?.phone?.replace(/\D/g, '') || "";
 
               const handleSendReminder = () => {
@@ -472,7 +475,7 @@ export default function FinancialCenter() {
                       </div>
                       <div>
                         <Label className="text-xs font-bold text-stone-600 mb-1 block">Mês de Referência (MM/YYYY)</Label>
-                        <Input value={tissForm.mes_referencia} onChange={(e) => setTissForm({...tissForm, mes_referencia: e.target.value})} placeholder="Ex: 09/2026" className="bg-white"/>
+                        <Input value={tissForm.mes_referencia} onChange={(e) => setTissForm({...tissForm, mes_referencia: e.target.value})} placeholder="Ex: 10/2026" className="bg-white"/>
                       </div>
                       <div>
                         <Label className="text-xs font-bold text-stone-600 mb-1 block">Valor Total das Guias (R$)</Label>
@@ -484,7 +487,6 @@ export default function FinancialCenter() {
                     </div>
                   </DialogContent>
                 </Dialog>
-
               </div>
               
               <div className="space-y-3 flex-1 overflow-y-auto custom-scrollbar">

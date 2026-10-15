@@ -9,10 +9,10 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
 export default function PatientPortal() {
-  const { user, logout } = useAuth();
+  const { logout } = useAuth();
   const qc = useQueryClient();
   const [activeTab, setActiveTab] = useState("home");
   
@@ -31,11 +31,13 @@ export default function PatientPortal() {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
 
   useEffect(() => {
-    window.addEventListener('beforeinstallprompt', (e) => {
+    const handler = (e) => {
       e.preventDefault();
       setDeferredPrompt(e);
       setShowInstallPrompt(true);
-    });
+    };
+    window.addEventListener('beforeinstallprompt', handler);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
 
   const handleInstallApp = async () => {
@@ -45,7 +47,7 @@ export default function PatientPortal() {
       if (outcome === 'accepted') setShowInstallPrompt(false);
       setDeferredPrompt(null);
     } else {
-      toast.info("Para instalar o app", { description: "Toque nos 3 pontinhos do Chrome e selecione 'Adicionar à tela inicial'." });
+      toast.info("Para instalar o app", { description: "Toque nos 3 pontinhos do navegador e selecione 'Adicionar à tela inicial'." });
     }
   };
 
@@ -54,14 +56,12 @@ export default function PatientPortal() {
     queryFn: async () => (await api.get("/portal/dashboard")).data
   });
 
-  // Sincroniza dados do banco com a tela
   useEffect(() => {
     if (dashboardData) {
-      let count = (dashboardData.nextSession ? 1 : 0) + (dashboardData.diaries?.length || 0);
+      const count = (dashboardData.nextSession ? 1 : 0) + (dashboardData.diaries?.length || 0);
       const lastRead = localStorage.getItem("@vox_notif_read");
       if (!lastRead || parseInt(lastRead) < count) setUnreadNotifications(count);
       
-      // Carrega as configs que vieram do banco
       if (dashboardData.settings && Object.keys(dashboardData.settings).length > 0) {
         setNotifSettings(dashboardData.settings);
       }
@@ -69,30 +69,33 @@ export default function PatientPortal() {
   }, [dashboardData]);
 
   const completeActivity = useMutation({
-    mutationFn: async (activity) => await api.post('/portal/activities/complete', { activity_id: activity.id, title: activity.title }),
-    onSuccess: () => { toast.success("Treino registrado! O doutor será avisado."); setSelectedActivity(null); }
+    mutationFn: async (activity) => await api.post('/portal/activities/complete', { activity_id: activity.id || activity.activity_id, title: activity.title }),
+    onSuccess: () => {
+      toast.success("Treino registrado! O fonoaudiólogo foi avisado.");
+      setSelectedActivity(null);
+      qc.invalidateQueries({ queryKey: ["patient_portal_dashboard"] });
+    }
   });
 
   const submitDiary = useMutation({
     mutationFn: async (diary) => await api.post('/portal/diaries/submit', { diary_id: diary.id, title: diary.title, answers: diaryAnswers }),
-    onSuccess: () => { toast.success("Respostas enviadas com sucesso para a IA!"); setSelectedDiary(null); setDiaryAnswers({}); }
+    onSuccess: () => {
+      toast.success("Respostas enviadas com sucesso para a clínica!");
+      setSelectedDiary(null);
+      setDiaryAnswers({});
+      qc.invalidateQueries({ queryKey: ["patient_portal_dashboard"] });
+    },
+    onError: () => toast.error("Erro ao enviar respostas do diário.")
   });
 
-  // 🚀 A NOVA LÓGICA DE SALVAMENTO (Atualização Imediata no Cache)
   const saveSettings = useMutation({
     mutationFn: async (settings) => await api.post('/portal/settings', settings),
     onSuccess: (_, variables) => {
       toast.success("Preferências salvas com sucesso!");
-      
-      // Forçamos o aplicativo a gravar a nova configuração na memória na mesma hora!
-      qc.setQueryData(["patient_portal_dashboard"], (oldData) => {
-        if (!oldData) return oldData;
-        return { ...oldData, settings: variables };
-      });
-      
+      qc.setQueryData(["patient_portal_dashboard"], (oldData) => oldData ? { ...oldData, settings: variables } : oldData);
       setIsSettingsOpen(false);
     },
-    onError: () => toast.error("Ocorreu um erro ao salvar as configurações no servidor.")
+    onError: () => toast.error("Ocorreu um erro ao salvar as configurações.")
   });
 
   const handleOpenNotifications = () => {
@@ -110,16 +113,24 @@ export default function PatientPortal() {
     return `${dataFormatada.charAt(0).toUpperCase() + dataFormatada.slice(1)} · ${date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
   };
 
-  if (isLoading) return <div className="min-h-screen bg-stone-50 flex items-center justify-center flex-col gap-4"><Activity size={32} className="text-[#D46F54] animate-pulse" /><p className="text-stone-500 text-sm font-bold animate-pulse">Sincronizando seus dados...</p></div>;
+  if (isLoading) return (
+    <div className="min-h-screen bg-stone-50 flex items-center justify-center flex-col gap-4">
+      <Activity size={32} className="text-[#D46F54] animate-pulse" />
+      <p className="text-stone-500 text-sm font-bold animate-pulse">Sincronizando seus dados...</p>
+    </div>
+  );
 
-  const { patient, nextSession, diaries, activities } = dashboardData || {};
+  const { patient, nextSession, diaries = [], activities = [] } = dashboardData || {};
 
   return (
     <div className="min-h-screen bg-stone-50 pb-24 font-sans animate-in fade-in duration-500 relative">
       
       {showInstallPrompt && (
         <div className="bg-[#D46F54] text-white px-4 py-3 flex items-center justify-between shadow-md relative z-50">
-          <div className="flex items-center gap-3"><div className="bg-white p-1.5 rounded-lg text-[#D46F54]"><Download size={18} /></div><div className="text-sm"><p className="font-bold">Instalar Aplicativo</p><p className="text-[10px] opacity-90">Acesso rápido na tela inicial</p></div></div>
+          <div className="flex items-center gap-3">
+            <div className="bg-white p-1.5 rounded-lg text-[#D46F54]"><Download size={18} /></div>
+            <div className="text-sm"><p className="font-bold">Instalar Aplicativo</p><p className="text-[10px] opacity-90">Acesso rápido na tela inicial</p></div>
+          </div>
           <button onClick={handleInstallApp} className="bg-white text-[#D46F54] text-xs font-bold px-3 py-1.5 rounded-full shadow-sm">Instalar</button>
         </div>
       )}
@@ -153,14 +164,18 @@ export default function PatientPortal() {
         {activeTab === "home" && (
           <div className="animate-in fade-in slide-in-from-bottom-4">
             <h3 className="font-bold text-stone-800 mb-4 flex items-center gap-2"><Activity size={18} className="text-[#D46F54]" /> Atividades de Hoje</h3>
-            {activities && activities.slice(0,1).map((act) => (
-              <div key={act.id} onClick={() => setSelectedActivity(act)} className="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 flex items-center justify-between mb-4 hover:border-indigo-300 transition-colors cursor-pointer active:scale-95">
-                <div className="flex items-center gap-4"><div className="w-12 h-12 bg-indigo-50 text-indigo-500 rounded-xl flex items-center justify-center shrink-0"><Play size={20} className="ml-1" /></div><div><h4 className="text-sm font-bold text-stone-800">{act.title}</h4><p className="text-xs text-stone-500 mt-0.5">{act.desc}</p></div></div><ChevronRight size={20} className="text-stone-300" />
-              </div>
-            ))}
-            {diaries && diaries.length > 0 && (
+            {activities.length === 0 ? (
+              <div className="bg-white rounded-2xl p-6 text-center text-stone-400 text-xs italic border border-stone-100 mb-4">Nenhum exercício pendente para hoje.</div>
+            ) : (
+              activities.slice(0, 2).map((act) => (
+                <div key={act.id} onClick={() => setSelectedActivity(act)} className="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 flex items-center justify-between mb-4 hover:border-indigo-300 transition-colors cursor-pointer active:scale-95">
+                  <div className="flex items-center gap-4"><div className="w-12 h-12 bg-indigo-50 text-indigo-500 rounded-xl flex items-center justify-center shrink-0"><Play size={20} className="ml-1" /></div><div><h4 className="text-sm font-bold text-stone-800">{act.title}</h4><p className="text-xs text-stone-500 mt-0.5 line-clamp-1">{act.desc || act.description}</p></div></div><ChevronRight size={20} className="text-stone-300" />
+                </div>
+              ))
+            )}
+            {diaries.length > 0 && (
               <div onClick={() => setActiveTab("diary")} className="bg-rose-50/50 rounded-2xl p-4 shadow-sm border border-rose-100 flex items-center justify-between cursor-pointer active:scale-95 transition-transform group">
-                <div className="flex items-center gap-4"><div className="w-12 h-12 bg-rose-100 text-rose-500 rounded-xl flex items-center justify-center shrink-0"><BookHeart size={20} /></div><div><h4 className="text-sm font-bold text-rose-900">Lembrete de Diário</h4><p className="text-xs text-rose-600/80 font-medium mt-0.5">Você tem {diaries.length} questionário(s) pendente(s)</p></div></div><ChevronRight size={20} className="text-rose-300" />
+                <div className="flex items-center gap-4"><div className="w-12 h-12 bg-rose-100 text-rose-500 rounded-xl flex items-center justify-center shrink-0"><BookHeart size={20} /></div><div><h4 className="text-sm font-bold text-rose-900">Lembrete de Diário</h4><p className="text-xs text-rose-600/80 font-medium mt-0.5">Você tem {diaries.length} questionário(s) disponível(is)</p></div></div><ChevronRight size={20} className="text-rose-300" />
               </div>
             )}
           </div>
@@ -171,9 +186,11 @@ export default function PatientPortal() {
              <h2 className="font-heading text-2xl font-bold text-stone-800 mb-1">Seus Treinos</h2>
              <p className="text-xs text-stone-500 mb-6">Exercícios recomendados pela clínica.</p>
              <div className="space-y-4">
-               {activities && activities.map((act) => (
+               {activities.length === 0 ? (
+                 <div className="text-center p-8 border-2 border-dashed border-stone-200 rounded-2xl text-stone-400 text-sm">Nenhum treino prescrito no momento.</div>
+               ) : activities.map((act) => (
                  <div key={act.id} onClick={() => setSelectedActivity(act)} className="bg-white border border-stone-200 rounded-2xl p-4 shadow-sm flex items-center justify-between cursor-pointer active:scale-95 transition-transform">
-                   <div className="flex items-center gap-4"><div className="w-12 h-12 bg-indigo-50 text-indigo-500 rounded-xl flex items-center justify-center shrink-0"><AudioLines size={20} /></div><div><h4 className="text-sm font-bold text-stone-800">{act.title}</h4><p className="text-[10px] text-stone-500 font-bold uppercase tracking-widest mt-0.5">{act.desc}</p></div></div><div className="w-8 h-8 rounded-full bg-stone-50 flex items-center justify-center border border-stone-100"><Play size={14} className="text-stone-400 ml-0.5" /></div>
+                   <div className="flex items-center gap-4"><div className="w-12 h-12 bg-indigo-50 text-indigo-500 rounded-xl flex items-center justify-center shrink-0"><AudioLines size={20} /></div><div><h4 className="text-sm font-bold text-stone-800">{act.title}</h4><p className="text-[10px] text-stone-500 font-bold uppercase tracking-widest mt-0.5 line-clamp-1">{act.desc || act.description}</p></div></div><div className="w-8 h-8 rounded-full bg-stone-50 flex items-center justify-center border border-stone-100"><Play size={14} className="text-stone-400 ml-0.5" /></div>
                  </div>
                ))}
              </div>
@@ -184,8 +201,8 @@ export default function PatientPortal() {
           <div className="animate-in fade-in slide-in-from-bottom-4">
              <div className="bg-[#F3E7E4] rounded-3xl p-6 text-center mb-6 shadow-inner"><div className="w-16 h-16 bg-white rounded-full flex items-center justify-center mx-auto mb-3 shadow-sm text-[#D46F54]"><BookHeart size={32} /></div><h3 className="font-bold text-stone-800 mb-1 text-lg">Diários Clínicos</h3><p className="text-xs text-stone-600 max-w-[250px] mx-auto leading-relaxed">Responda aos questionários para a IA monitorar sua evolução.</p></div>
              <div className="space-y-4">
-               {diaries && diaries.length > 0 ? diaries.map((diary) => (
-                   <div key={diary.id} className="bg-white border border-stone-200 rounded-2xl p-5 shadow-sm relative overflow-hidden flex flex-col"><div className={`absolute left-0 top-0 bottom-0 w-1.5 ${diary.type === 'emocoes' ? 'bg-rose-400' : diary.type === 'fadiga' ? 'bg-amber-400' : 'bg-blue-400'}`}></div><div className="flex justify-between items-start mb-2"><h4 className="font-bold text-stone-800 text-sm max-w-[70%]">{diary.title}</h4><span className="bg-rose-100 text-rose-700 text-[9px] font-bold px-2 py-1 rounded uppercase tracking-wider">Pendente</span></div><p className="text-xs text-stone-500 mb-5 leading-relaxed">{diary.desc}</p><Button onClick={() => setSelectedDiary(diary)} className="w-full bg-stone-900 hover:bg-stone-800 text-white rounded-xl h-11 text-xs font-bold shadow-md transition-transform hover:scale-[1.02]">Responder Agora ({diary.questions_count || diary.questions?.length || 1} pgtas)</Button></div>
+               {diaries.length > 0 ? diaries.map((diary) => (
+                   <div key={diary.id} className="bg-white border border-stone-200 rounded-2xl p-5 shadow-sm relative overflow-hidden flex flex-col"><div className={`absolute left-0 top-0 bottom-0 w-1.5 ${diary.type === 'emocoes' ? 'bg-rose-400' : diary.type === 'fadiga' ? 'bg-amber-400' : 'bg-blue-400'}`}></div><div className="flex justify-between items-start mb-2"><h4 className="font-bold text-stone-800 text-sm max-w-[70%]">{diary.title}</h4><span className="bg-rose-100 text-rose-700 text-[9px] font-bold px-2 py-1 rounded uppercase tracking-wider">Pendente</span></div><p className="text-xs text-stone-500 mb-5 leading-relaxed">{diary.desc}</p><Button onClick={() => { setDiaryAnswers({}); setSelectedDiary(diary); }} className="w-full bg-stone-900 hover:bg-stone-800 text-white rounded-xl h-11 text-xs font-bold shadow-md transition-transform hover:scale-[1.02]">Responder Agora ({diary.questions?.length || 1} pgtas)</Button></div>
                )) : <div className="text-center p-8 border-2 border-dashed border-stone-200 rounded-2xl"><LayoutTemplate size={32} className="text-stone-300 mx-auto mb-3" /><p className="font-bold text-stone-700 text-sm">Nenhum diário ativo</p></div>}
              </div>
           </div>
@@ -207,9 +224,9 @@ export default function PatientPortal() {
         <DialogContent className="max-w-md w-[90vw] bg-white border-stone-200 rounded-[2rem] p-0 overflow-hidden flex flex-col max-h-[85vh] hide-default-close">
           <div className="p-6 border-b border-stone-100 flex justify-between items-center bg-stone-50/50"><h2 className="font-heading text-xl font-bold text-stone-800 flex items-center gap-2"><BellRing size={20} className="text-[#D46F54]" /> Central de Avisos</h2><button onClick={() => setIsNotificationsOpen(false)} className="text-stone-400 hover:text-rose-500 p-2"><X size={20}/></button></div>
           <div className="p-6 overflow-y-auto custom-scrollbar space-y-4 bg-white">
-            {nextSession && (<div className="flex gap-4 p-4 bg-emerald-50 border border-emerald-100 rounded-2xl animate-in fade-in slide-in-from-right-4"><div className="w-10 h-10 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center shrink-0"><Calendar size={18}/></div><div><h4 className="text-sm font-bold text-stone-800 mb-1">Consulta Confirmada</h4><p className="text-xs text-stone-600 leading-relaxed">Sua sessão está agendada para {formatSessionDate(nextSession.start_time)}. Te esperamos!</p></div></div>)}
-            {diaries && diaries.length > 0 && (<div className="flex gap-4 p-4 bg-rose-50 border border-rose-100 rounded-2xl animate-in fade-in slide-in-from-right-4 delay-75"><div className="w-10 h-10 rounded-full bg-rose-100 text-rose-500 flex items-center justify-center shrink-0"><BookHeart size={18}/></div><div><h4 className="text-sm font-bold text-stone-800 mb-1">Novo Diário Disponível</h4><p className="text-xs text-stone-600 leading-relaxed">A clínica liberou {diaries.length} questionário(s) de rotina para você.</p></div></div>)}
-            {!nextSession && (!diaries || diaries.length === 0) && (<div className="text-center p-8"><Bell size={32} className="text-stone-200 mx-auto mb-3" /><p className="text-sm font-bold text-stone-500">Tudo limpo por aqui!</p></div>)}
+            {nextSession && (<div className="flex gap-4 p-4 bg-emerald-50 border border-emerald-100 rounded-2xl"><div className="w-10 h-10 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center shrink-0"><Calendar size={18}/></div><div><h4 className="text-sm font-bold text-stone-800 mb-1">Consulta Confirmada</h4><p className="text-xs text-stone-600 leading-relaxed">Sua sessão está agendada para {formatSessionDate(nextSession.start_time)}.</p></div></div>)}
+            {diaries.length > 0 && (<div className="flex gap-4 p-4 bg-rose-50 border border-rose-100 rounded-2xl"><div className="w-10 h-10 rounded-full bg-rose-100 text-rose-500 flex items-center justify-center shrink-0"><BookHeart size={18}/></div><div><h4 className="text-sm font-bold text-stone-800 mb-1">Novo Diário Disponível</h4><p className="text-xs text-stone-600 leading-relaxed">A clínica liberou {diaries.length} questionário(s) de rotina para você.</p></div></div>)}
+            {!nextSession && diaries.length === 0 && (<div className="text-center p-8"><Bell size={32} className="text-stone-200 mx-auto mb-3" /><p className="text-sm font-bold text-stone-500">Tudo limpo por aqui!</p></div>)}
           </div>
         </DialogContent>
       </Dialog>
@@ -230,46 +247,60 @@ export default function PatientPortal() {
         </DialogContent>
       </Dialog>
 
-      {/* ========================================== */}
-      {/* MODAL DE TREINO VOCAL (ATIVIDADE REAL)       */}
-      {/* ========================================== */}
+      {/* MODAL DE TREINO VOCAL */}
       <Dialog open={!!selectedActivity} onOpenChange={() => setSelectedActivity(null)}>
         <DialogContent className="max-w-md w-[90vw] bg-white border-stone-200 rounded-[2rem] p-0 overflow-hidden flex flex-col max-h-[85vh] hide-default-close">
-          
           <div className="bg-indigo-600 p-6 text-white shrink-0 relative flex flex-col items-center text-center">
-            <button onClick={() => setSelectedActivity(null)} className="absolute top-4 right-4 p-2 bg-black/10 hover:bg-black/20 rounded-full transition-colors backdrop-blur-sm">
-              <X size={16}/>
-            </button>
-            <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mb-3 border border-white/20">
-              <AudioLines size={32} className="text-white" />
-            </div>
+            <button onClick={() => setSelectedActivity(null)} className="absolute top-4 right-4 p-2 bg-black/10 hover:bg-black/20 rounded-full transition-colors"><X size={16}/></button>
+            <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mb-3 border border-white/20"><AudioLines size={32} className="text-white" /></div>
             <DialogTitle className="font-heading text-xl leading-tight">{selectedActivity?.title}</DialogTitle>
-            <p className="text-[10px] uppercase tracking-widest text-indigo-200 font-bold mt-2">
-              Prescrito pela Clínica
-            </p>
+            <p className="text-[10px] uppercase tracking-widest text-indigo-200 font-bold mt-2">Prescrito pela Clínica</p>
           </div>
-          
           <div className="p-6 overflow-y-auto custom-scrollbar flex-1 bg-stone-50">
-            {/* Texto detalhado com quebra de linhas reais geradas pela IA */}
             <div className="text-sm text-stone-700 leading-relaxed whitespace-pre-wrap font-medium bg-white p-5 rounded-2xl border border-stone-100 shadow-sm">
               {selectedActivity?.description || selectedActivity?.desc || "Nenhuma instrução detalhada fornecida para este exercício."}
             </div>
           </div>
-
-          <div className="p-5 border-t border-stone-100 shrink-0 bg-white shadow-[0_-10px_30px_rgba(0,0,0,0.03)] z-10">
-            <Button 
-              onClick={() => completeActivity.mutate(selectedActivity)} 
-              disabled={completeActivity.isPending} 
-              className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-bold h-14 rounded-xl text-base shadow-md transition-transform active:scale-[0.98]"
-            >
+          <div className="p-5 border-t border-stone-100 shrink-0 bg-white">
+            <Button onClick={() => completeActivity.mutate(selectedActivity)} disabled={completeActivity.isPending} className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-bold h-14 rounded-xl text-base shadow-md">
               {completeActivity.isPending ? "Registrando progresso..." : "Finalizei o Treino de Hoje!"}
             </Button>
           </div>
         </DialogContent>
       </Dialog>
 
+      {/* MODAL DE DIÁRIO CLÍNICO */}
       <Dialog open={!!selectedDiary} onOpenChange={() => setSelectedDiary(null)}>
-        <DialogContent className="max-w-md w-[90vw] bg-white border-stone-200 rounded-[2rem] p-0 overflow-hidden flex flex-col max-h-[85vh] hide-default-close"><div className="bg-[#D46F54] p-6 text-white shrink-0 text-center relative"><button onClick={() => setSelectedDiary(null)} className="absolute top-4 right-4 p-2 bg-black/10 rounded-full backdrop-blur-sm"><X size={16}/></button><BookHeart size={32} className="mx-auto mb-2 opacity-80" /><DialogTitle className="font-heading text-xl">{selectedDiary?.title}</DialogTitle></div><div className="p-6 overflow-y-auto custom-scrollbar flex-1 space-y-6">{selectedDiary?.questions?.map((q, idx) => (<div key={idx} className="bg-stone-50 p-4 rounded-2xl border border-stone-100"><p className="text-sm font-bold text-stone-800 mb-3">{idx + 1}. {q}</p><input type="range" min="0" max="10" value={diaryAnswers[idx] || 5} onChange={(e) => setDiaryAnswers({...diaryAnswers, [idx]: e.target.value})} className="w-full accent-[#D46F54] h-2 bg-stone-200 rounded-lg appearance-none cursor-pointer mb-2" /><div className="flex justify-between text-[10px] font-bold text-stone-400 uppercase tracking-widest"><span>Nada ({diaryAnswers[idx] || 5})</span><span>Muito</span></div></div>)) || <p className="text-center text-sm text-stone-500">Nenhuma pergunta cadastrada.</p>}</div><div className="p-5 border-t border-stone-100 shrink-0 bg-white"><Button onClick={() => submitDiary.mutate(selectedDiary)} disabled={submitDiary.isPending} className="w-full bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold h-14 rounded-xl text-base shadow-md">{submitDiary.isPending ? "Enviando..." : "Enviar Respostas"}</Button></div></DialogContent>
+        <DialogContent className="max-w-md w-[90vw] bg-white border-stone-200 rounded-[2rem] p-0 overflow-hidden flex flex-col max-h-[85vh] hide-default-close">
+          <div className="bg-[#D46F54] p-6 text-white shrink-0 text-center relative">
+            <button onClick={() => setSelectedDiary(null)} className="absolute top-4 right-4 p-2 bg-black/10 rounded-full"><X size={16}/></button>
+            <BookHeart size={32} className="mx-auto mb-2 opacity-80" />
+            <DialogTitle className="font-heading text-xl">{selectedDiary?.title}</DialogTitle>
+          </div>
+          <div className="p-6 overflow-y-auto custom-scrollbar flex-1 space-y-6">
+            {selectedDiary?.questions?.map((q, idx) => (
+              <div key={idx} className="bg-stone-50 p-4 rounded-2xl border border-stone-100">
+                <p className="text-sm font-bold text-stone-800 mb-3">{idx + 1}. {q}</p>
+                <input
+                  type="range" min="0" max="10"
+                  value={diaryAnswers[idx] ?? 5}
+                  onChange={(e) => setDiaryAnswers({...diaryAnswers, [idx]: Number(e.target.value)})}
+                  className="w-full accent-[#D46F54] h-2 bg-stone-200 rounded-lg appearance-none cursor-pointer mb-2"
+                />
+                <div className="flex justify-between text-[10px] font-bold text-stone-400 uppercase tracking-widest">
+                  <span>Nada (0)</span>
+                  <span className="text-[#D46F54] text-xs">Nota: {diaryAnswers[idx] ?? 5}</span>
+                  <span>Muito (10)</span>
+                </div>
+              </div>
+            )) || <p className="text-center text-sm text-stone-500">Nenhuma pergunta cadastrada.</p>}
+          </div>
+          <div className="p-5 border-t border-stone-100 shrink-0 bg-white">
+            <Button onClick={() => submitDiary.mutate(selectedDiary)} disabled={submitDiary.isPending} className="w-full bg-[#D46F54] hover:bg-[#B75C46] text-white font-bold h-14 rounded-xl text-base shadow-md">
+              {submitDiary.isPending ? "Enviando..." : "Enviar Respostas"}
+            </Button>
+          </div>
+        </DialogContent>
       </Dialog>
 
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-stone-200 pb-safe pt-2 px-6 flex justify-between items-center z-40 rounded-t-[2rem] shadow-[0_-15px_40px_rgba(0,0,0,0.06)]">

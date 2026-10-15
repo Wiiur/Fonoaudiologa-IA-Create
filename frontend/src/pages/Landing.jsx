@@ -1,22 +1,29 @@
 import React from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { CheckCircle2, ShieldCheck, FileText, BrainCircuit, Activity, Calendar, Lock } from "lucide-react";
+import { toast } from "sonner";
+import { CheckCircle2, ShieldCheck, FileText, BrainCircuit, Activity, Calendar, Lock, Sparkles } from "lucide-react";
 
 const IMG = "https://images.unsplash.com/photo-1782397132123-0166b524d6bc?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1OTV8MHwxfHNlYXJjaHwyfHxtaW5pbWFsaXN0JTIwbW9kZXJuJTIwY2xpbmljJTIwaW50ZXJpb3J8ZW58MHx8fHwxNzgzMTcxNDQwfDA&ixlib=rb-4.1.0&q=85";
 
 export default function Landing() {
   const navigate = useNavigate();
 
-  // Agora, qualquer tentativa de Login leva para a sua tela de Login Unificada
   const handleLogin = () => {
     navigate("/login");
+  };
+
+  const handleSubscribeBeta = () => {
+    toast.warning("Assinaturas Temporariamente Bloqueadas", {
+      description: "O VoxIntelligence está em fase de Beta Fechado exclusivo para doutores convidados. Se você já recebeu sua credencial, clique em 'Acessar Conta'.",
+      duration: 5000,
+    });
   };
 
   return (
     <div className="min-h-screen bg-[#FAF9F6] text-stone-900 scroll-smooth">
       
-      {/* ================= HEADER ================= */}
+      {/* HEADER */}
       <header className="border-b border-stone-200 bg-white/80 backdrop-blur-xl sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-6 md:px-10 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -44,11 +51,11 @@ export default function Landing() {
         </div>
       </header>
 
-      {/* ================= HERO ================= */}
+      {/* HERO */}
       <section className="max-w-7xl mx-auto px-6 md:px-10 py-16 md:py-24 grid grid-cols-1 lg:grid-cols-2 gap-14 items-center">
         <div className="animate-in fade-in slide-in-from-bottom-8 duration-700">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#F3E7E4] text-[#B75C46] text-xs font-bold tracking-widest uppercase">
-            <SparklesIcon /> Plataforma SaaS Exclusiva
+            <Sparkles size={14} /> Plataforma SaaS Exclusiva
           </div>
           <h1 className="font-heading text-4xl sm:text-5xl lg:text-6xl tracking-tight leading-[1.1] mt-6 font-bold text-stone-800">
             A clínica do futuro,<br />
@@ -82,7 +89,6 @@ export default function Landing() {
             className="rounded-2xl border border-stone-200 shadow-xl object-cover w-full h-[520px]"
           />
           
-          {/* Card Flutuante Simulando o Sistema */}
           <div className="absolute -bottom-6 -left-6 bg-white border border-stone-200 rounded-2xl p-5 shadow-xl w-72">
             <div className="flex items-center justify-between mb-3">
               <div className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">Próxima Sessão</div>
@@ -94,14 +100,14 @@ export default function Landing() {
               </div>
               <div>
                 <div className="font-heading text-sm font-bold text-stone-800">Ana Pereira</div>
-                <div className="text-xs font-medium text-stone-500">Terapia de Disfagia</div>
+                <div className="text-xs font-medium text-stone-500">Terapia Vocal & Praat</div>
               </div>
             </div>
           </div>
         </div>
       </section>
 
-      {/* ================= MÓDULOS ================= */}
+      {/* MÓDULOS */}
       <section id="modulos" className="bg-white border-y border-stone-200 py-24">
         <div className="max-w-7xl mx-auto px-6 md:px-10">
           <div className="mb-14 text-center max-w-2xl mx-auto">
@@ -115,8 +121,8 @@ export default function Landing() {
             {[
               { icon: Calendar, t: "Gestão de Agenda", d: "Agendamentos, lembretes via WhatsApp gerados por IA e controle de retornos de forma automatizada." },
               { icon: BrainCircuit, t: "Copiloto IA Clínico", d: "Auditoria científica de laudos e extração de histórico clínico cruzando dezenas de evoluções." },
-              { icon: FileText, t: "Faturamento & IRPF", d: "Emissão de recibos com validade fiscal, extratos DMED e relatórios de fluxo de caixa automáticos." },
-              { icon: Activity, t: "Laboratório Vocal", d: "Análise acústica integrada (Jitter, Shimmer, F0) com geração de gráficos direto no prontuário." },
+              { icon: FileText, t: "Faturamento & IRPF", d: "Emissão de recibos com validade fiscal, extratos DMED, cobranças PIX e fluxo de caixa automáticos." },
+              { icon: Activity, t: "Laboratório Vocal", d: "Análise acústica integrada (Praat, Jitter, Shimmer, F0) e desafios vocais guiados por biofeedback." },
               { icon: ShieldCheck, t: "Prontuário LGPD", d: "Evoluções SOAP salvas em contêineres criptografados, com separação estrita de acessos para a equipe." },
               { icon: Lock, t: "Controle de Equipe", d: "Cadastre secretárias com acessos limitados e integre profissionais associados em um único ambiente." },
             ].map((f, i) => (
@@ -132,14 +138,14 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ================= COMO FUNCIONA ================= */}
+      {/* COMO FUNCIONA */}
       <section id="como" className="py-24 bg-[#FAF9F6]">
         <div className="max-w-7xl mx-auto px-6 md:px-10">
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
             {[
               { n: "01", t: "Cadastro da Clínica", d: "Após a assinatura, você configura sua identidade visual, logotipo e vincula sua secretária com acessos restritos." },
               { n: "02", t: "Prontuários Inteligentes", d: "Durante o atendimento, a IA estrutura seu raciocínio, sugere referenciais teóricos e compila tudo em PDFs elegantes." },
-              { n: "03", t: "Faturamento Automático", d: "Ao receber pagamentos, o sistema gera Recibos IRPF válidos e traça gráficos de rentabilidade por paciente." },
+              { n: "03", t: "Faturamento Automático", d: "Ao receber pagamentos via PIX, o sistema atualiza o caixa automaticamente, emite Recibos IRPF e calcula o LTV." },
             ].map((s, i) => (
               <div key={s.n} className="relative">
                 {i !== 2 && <div className="hidden lg:block absolute top-8 left-16 right-0 h-px bg-stone-300 w-full" />}
@@ -152,7 +158,7 @@ export default function Landing() {
         </div>
       </section>
 
-      {/* ================= PLANOS E ASSINATURA ================= */}
+      {/* PLANOS E ASSINATURA */}
       <section id="planos" className="py-24 bg-stone-900 text-white border-y border-stone-800">
         <div className="max-w-5xl mx-auto px-6 md:px-10 text-center">
           <div className="text-xs uppercase tracking-widest text-[#D46F54] font-bold mb-4">Assinatura SaaS</div>
@@ -176,10 +182,10 @@ export default function Landing() {
             <div className="space-y-4 mb-8 text-left">
               {[
                 "Prontuários e Pacientes Ilimitados",
+                "Laboratório Acústico Praat & Desafios Guiados",
                 "Copiloto IA Científico Integrado",
-                "Emissão de Recibos IRPF e Relatórios",
-                "Acesso para Secretária (LGPD)",
-                "Suporte Técnico Prioritário"
+                "Psicobank PIX, Recibos IRPF e Relatórios",
+                "Acesso para Secretária (LGPD) & App do Paciente"
               ].map((feature, i) => (
                 <div key={i} className="flex items-center gap-3 text-sm font-medium text-stone-300">
                   <CheckCircle2 size={18} className="text-emerald-400 shrink-0" />
@@ -188,15 +194,36 @@ export default function Landing() {
               ))}
             </div>
             
-            <Button onClick={() => alert("Módulo de Pagamento Stripe/Pagar.me em desenvolvimento.")} className="w-full h-14 bg-white hover:bg-stone-200 text-stone-900 font-bold rounded-xl text-base transition-transform hover:scale-[1.02]">
-              Assinar VoxIntelligence
+            <div className="bg-stone-900/80 border border-amber-500/30 rounded-2xl p-4 mb-4 text-left flex items-start gap-3">
+              <Lock size={18} className="text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-xs font-bold text-amber-300 uppercase tracking-wider">Fase de Beta Fechado</p>
+                <p className="text-[11px] text-stone-400 mt-0.5 leading-relaxed">
+                  Novas assinaturas públicas estão temporariamente bloqueadas. O acesso é liberado exclusivamente para fonoaudiólogos convidados pela equipe de desenvolvimento.
+                </p>
+              </div>
+            </div>
+
+            <Button
+              onClick={handleSubscribeBeta}
+              className="w-full h-14 bg-stone-700 hover:bg-stone-600 text-stone-300 font-bold rounded-xl text-sm flex items-center justify-center gap-2 cursor-not-allowed"
+            >
+              <Lock size={16} /> Assinaturas Bloqueadas (Beta Fechado)
+            </Button>
+
+            <Button
+              onClick={handleLogin}
+              variant="ghost"
+              className="w-full mt-3 text-xs font-bold text-[#D46F54] hover:text-white hover:bg-stone-700/50 rounded-xl h-10"
+            >
+              Já sou convidado(a) do Beta → Acessar minha conta
             </Button>
             <p className="text-[10px] text-stone-500 font-bold uppercase tracking-widest mt-4">Cancele quando quiser</p>
           </div>
         </div>
       </section>
 
-      {/* ================= FOOTER ================= */}
+      {/* FOOTER */}
       <footer className="bg-stone-950 py-12 text-center text-stone-500 border-t border-stone-900">
         <div className="w-10 h-10 rounded-xl bg-stone-900 flex items-center justify-center text-[#D46F54] mx-auto mb-6">
           <Activity size={20} />
@@ -212,10 +239,3 @@ export default function Landing() {
     </div>
   );
 }
-
-// Pequeno ícone de faísca para substituir a FontAwesome (que você usava antes)
-const SparklesIcon = () => (
-  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
-  </svg>
-);

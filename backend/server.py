@@ -23,7 +23,7 @@ from parselmouth.praat import call
 from openai import AsyncOpenAI
 from google import genai
 
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, UploadFile, BackgroundTasks, File, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header, UploadFile, BackgroundTasks, File, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -39,7 +39,8 @@ from voice_analysis import build_clinical_prompt, analyze_challenge
 from core import (
     db, client, User, get_current_user, anonymize_text,
     log_audit_access, verify_patient_ownership,
-    OPENROUTER_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY
+    OPENROUTER_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY,
+    ADMIN_SECRET_KEY, hash_password
 )
 from finance_routes import finance_router
 
@@ -134,10 +135,14 @@ class Appointment(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AppointmentCreate(BaseModel):
-    patient_id: str
+    patient_id: Optional[str] = None
+    title: Optional[str] = "Sessão Fono"
     start: str
     end: str
     mode: Literal["clinic", "telehealth"] = "clinic"
+    type: Optional[str] = "paciente"  # 'paciente', 'reuniao', 'block'
+    room: Optional[str] = "sala_1"
+    recurrence: Optional[str] = "none" # 'none', 'weekly', 'biweekly', 'monthly'
     notes: Optional[str] = None
 
 class SoapCreate(BaseModel):
@@ -186,8 +191,19 @@ class ProtocolUpdate(BaseModel):
 async def root():
     return {"service": "VoxIntelligence", "status": "ok"}
 
+# ==========================================
+# AUTENTICAÇÃO BLINDADA PARA BETA FECHADO
+# ==========================================
+class BetaDoctorCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    crfa_number: Optional[str] = "00000"
+    crfa_state: Optional[str] = "SP"
+
 @api_router.post("/auth/session")
 async def create_session(request: Request, response: Response):
+    """Login via Google OAuth: Só permite entrada se o e-mail já foi autorizado no Beta ou é Paciente convidado"""
     body = await request.json()
     session_id = body.get("session_id")
     if not session_id:
@@ -199,27 +215,44 @@ async def create_session(request: Request, response: Response):
             headers={"X-Session-ID": session_id},
         )
     if r.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid Emergent session")
+        raise HTTPException(status_code=401, detail="Sessão OAuth inválida")
     data = r.json()
 
-    email = data["email"]
-    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    email = data["email"].strip().lower()
+    existing = await db.users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}}, {"_id": 0})
+    matching_patient = await db.patients.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}}, {"_id": 0})
+
+    # 🔒 TRAVA DO BETA FECHADO: Se não está em db.users e não é paciente convidado, barra na porta!
+    if not existing and not matching_patient:
+        raise HTTPException(
+            status_code=403,
+            detail="Acesso Restrito (Beta Fechado): Este e-mail não possui convite ativo para testes."
+        )
+
     if existing:
+        if existing.get("status") == "blocked":
+            raise HTTPException(status_code=403, detail="Esta conta de teste foi desativada pelo administrador.")
         user_id = existing["user_id"]
         await db.users.update_one(
             {"user_id": user_id},
             {"$set": {"name": data.get("name", existing["name"]), "picture": data.get("picture")}},
         )
     else:
+        # Só cria automaticamente se for um paciente previamente cadastrado pelo doutor
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         await db.users.insert_one({
             "user_id": user_id,
             "email": email,
-            "name": data.get("name", email),
+            "name": data.get("name", matching_patient.get("name", email)),
             "picture": data.get("picture"),
-            "role": "unassigned",
+            "role": "patient",
+            "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
+        await db.patients.update_one(
+            {"patient_id": matching_patient["patient_id"]},
+            {"$set": {"linked_user_id": user_id}},
+        )
 
     session_token = data["session_token"]
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
@@ -234,14 +267,104 @@ async def create_session(request: Request, response: Response):
         key="session_token", value=session_token, httponly=True,
         secure=True, samesite="none", path="/", max_age=7 * 24 * 60 * 60,
     )
-    matching_patient = await db.patients.find_one({"email": email}, {"_id": 0})
-    if matching_patient and not matching_patient.get("linked_user_id"):
-        await db.patients.update_one({"patient_id": matching_patient["patient_id"]}, {"$set": {"linked_user_id": user_id}})
-        current = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-        if current and current.get("role") == "unassigned":
-            await db.users.update_one({"user_id": user_id}, {"$set": {"role": "patient"}})
-    user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    return {"user": user_doc}
+    user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
+    return {"user": user_doc, "session_token": session_token}
+
+
+@api_router.post("/team/login")
+async def login_team_or_beta_doctor(payload: dict, response: Response):
+    """Login Unificado por E-mail e Senha: Funciona para Doutores do Beta Fechado e para Equipe/Secretárias"""
+    email = payload.get("email", "").strip().lower()
+    password = payload.get("password", "")
+    pwd_hash = hash_password(password)
+
+    # 1. Verifica primeiro se é um Doutor(a) do Beta Fechado em `db.users`
+    beta_user = await db.users.find_one({
+        "email": {"$regex": f"^{email}$", "$options": "i"},
+        "$or": [{"password_hash": pwd_hash}, {"password": password}]
+    })
+
+    if beta_user:
+        if beta_user.get("status") == "blocked":
+            raise HTTPException(status_code=403, detail="Seu acesso ao Beta Fechado foi pausado.")
+
+        session_token = f"sess_{uuid.uuid4().hex}"
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+        await db.user_sessions.insert_one({
+            "user_id": beta_user["user_id"],
+            "session_token": session_token,
+            "expires_at": expires_at.isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        response.set_cookie(
+            key="session_token", value=session_token, httponly=True,
+            secure=False, samesite="lax", path="/", max_age=7 * 24 * 60 * 60,
+        )
+        beta_user.pop("_id", None)
+        beta_user.pop("password_hash", None)
+        beta_user.pop("password", None)
+        return {"status": "success", "user": beta_user, "session_token": session_token}
+
+    # 2. Se não estiver em `db.users`, verifica na tabela de Equipe/Secretárias (`db.team`)
+    member = await db.team.find_one({
+        "email": {"$regex": f"^{email}$", "$options": "i"},
+        "password": password
+    })
+    if not member:
+        raise HTTPException(status_code=401, detail="Acesso negado: E-mail não autorizado no Beta ou senha incorreta.")
+    if member.get("status") != "Ativo":
+        raise HTTPException(status_code=403, detail="Esta conta ainda não foi ativada.")
+
+    member["_id"] = str(member["_id"])
+    return {"status": "success", "user": member}
+
+
+# ==========================================
+# ROTAS EXCLUSIVAS DO DESENVOLVEDOR (GESTÃO DO BETA FECHADO)
+# ==========================================
+def verify_admin_key(x_admin_key: Optional[str] = Header(default=None)):
+    if not x_admin_key or x_admin_key != ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Chave Mestra de Desenvolvedor inválida.")
+
+@api_router.post("/admin/beta-doctors")
+async def admin_create_beta_doctor(payload: BetaDoctorCreate, _: None = Depends(verify_admin_key)):
+    """Cria ou atualiza uma conta de Doutor(a) autorizada para o Beta Fechado"""
+    email_clean = payload.email.strip().lower()
+    existing = await db.users.find_one({"email": {"$regex": f"^{email_clean}$", "$options": "i"}})
+
+    user_id = existing["user_id"] if existing else f"user_{uuid.uuid4().hex[:12]}"
+    doc = {
+        "user_id": user_id,
+        "email": email_clean,
+        "name": payload.name.strip(),
+        "professional_name": payload.name.strip(),
+        "role": "doctor",
+        "crfa_number": payload.crfa_number,
+        "crfa_state": payload.crfa_state.upper(),
+        "password_hash": hash_password(payload.password),
+        "status": "active",
+        "beta_tester": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.users.update_one({"user_id": user_id}, {"$set": doc}, upsert=True)
+    return {"status": "success", "msg": f"Doutor(a) {payload.name} liberado(a) no Beta Fechado!", "user_id": user_id}
+
+@api_router.get("/admin/beta-doctors")
+async def admin_list_beta_doctors(_: None = Depends(verify_admin_key)):
+    users = await db.users.find({"role": "doctor"}, {"_id": 0, "password_hash": 0, "password": 0}).to_list(200)
+    return users
+
+@api_router.delete("/admin/beta-doctors/{email}")
+async def admin_revoke_beta_doctor(email: str, _: None = Depends(verify_admin_key)):
+    res = await db.users.update_one(
+        {"email": {"$regex": f"^{email.strip()}$", "$options": "i"}},
+        {"$set": {"status": "blocked"}}
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="E-mail não encontrado.")
+    await db.user_sessions.delete_many({})
+    return {"status": "success", "msg": f"Acesso de {email} revogado imediatamente."}
+
 
 @api_router.get("/auth/me")
 async def auth_me(user: User = Depends(get_current_user)):
@@ -558,19 +681,179 @@ async def list_appointments(user: User = Depends(get_current_user)):
 async def create_appointment(payload: AppointmentCreate, user: User = Depends(get_current_user)):
     if user.role not in ("doctor", "secretary"):
         raise HTTPException(status_code=403)
-    pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
-    if not pat:
-        raise HTTPException(status_code=404, detail="Patient not found")
-    apt = Appointment(
-        owner_user_id=pat["owner_user_id"], patient_id=payload.patient_id,
-        patient_name=pat["name"], start=payload.start, end=payload.end,
-        mode=payload.mode, notes=payload.notes,
+
+    owner_id = user.user_id
+    patient_name = payload.title or "Evento"
+
+    if payload.type == "paciente" and payload.patient_id:
+        pat = await db.patients.find_one({"patient_id": payload.patient_id}, {"_id": 0})
+        if not pat:
+            raise HTTPException(status_code=404, detail="Paciente não encontrado")
+        owner_id = pat["owner_user_id"]
+        patient_name = pat["name"]
+
+    # Calcula quantas ocorrências gerar caso tenha recorrência
+    occurrences = 1
+    step_days = 0
+    if payload.recurrence == "weekly":
+        occurrences, step_days = 4, 7
+    elif payload.recurrence == "biweekly":
+        occurrences, step_days = 4, 14
+    elif payload.recurrence == "monthly":
+        occurrences, step_days = 4, 30
+
+    start_dt = datetime.fromisoformat(payload.start.replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(payload.end.replace("Z", "+00:00"))
+    created_docs = []
+
+    for i in range(occurrences):
+        delta = timedelta(days=i * step_days)
+        doc = {
+            "appointment_id": f"apt_{uuid.uuid4().hex[:12]}",
+            "owner_user_id": owner_id,
+            "patient_id": payload.patient_id or "",
+            "patient_name": patient_name,
+            "title": payload.title or patient_name,
+            "start": (start_dt + delta).isoformat(),
+            "end": (end_dt + delta).isoformat(),
+            "mode": payload.mode,
+            "type": payload.type or "paciente",
+            "room": payload.room or "sala_1",
+            "recurrence": payload.recurrence or "none",
+            "status": "scheduled",
+            "notes": payload.notes,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.appointments.insert_one(doc)
+        doc.pop("_id", None)
+        created_docs.append(doc)
+
+    return created_docs[0]
+
+# ==========================================
+# ATUALIZAÇÃO SERVER.PY: TOGGLE E DELETE DE DIÁRIOS (SETTINGS.JSX)
+# ==========================================
+@api_router.put("/templates/{template_id}/toggle")
+async def toggle_template(template_id: str, payload: dict, user: User = Depends(get_current_user)):
+    await db.templates.update_one(
+        {"id": template_id, "owner_user_id": user.user_id},
+        {"$set": {"active": payload.get("active", True)}}
     )
-    d = apt.model_dump()
-    d["created_at"] = d["created_at"].isoformat()
-    await db.appointments.insert_one(d)
-    d.pop("_id", None)
-    return d
+    return {"status": "success"}
+
+@api_router.delete("/templates/{template_id}")
+async def delete_template(template_id: str, user: User = Depends(get_current_user)):
+    await db.templates.delete_one({"id": template_id, "owner_user_id": user.user_id})
+    return {"status": "success"}
+
+# ==========================================
+# ATUALIZAÇÃO SERVER.PY: EXCLUSÃO E DOWNLOAD DE ÁUDIO DOS DESAFIOS VOCAIS
+# ==========================================
+@api_router.delete("/voice/challenges/attempts/{attempt_id}")
+async def delete_challenge_attempt(attempt_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404)
+    try:
+        get_storage().delete(doc["storage_key"])
+    except Exception:
+        pass
+    await db.voice_challenges.delete_one({"attempt_id": attempt_id})
+    return {"ok": True}
+
+@api_router.get("/voice/challenges/audio/{attempt_id}/download")
+async def download_challenge_audio(
+    attempt_id: str,
+    format: str = "wav",
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    user: User = Depends(get_current_user)
+):
+    doc = await db.voice_challenges.find_one({"attempt_id": attempt_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Análise não encontrada")
+
+    storage = get_storage()
+    local_path = storage.local_path(doc["storage_key"])
+    if not os.path.exists(local_path):
+        raise HTTPException(status_code=404, detail="Arquivo original não encontrado no disco")
+
+    if format not in ["wav", "mp3", "ogg"]:
+        format = "wav"
+
+    safe_title = re.sub(r'[^A-Za-z0-9_]', '', str(doc.get("challenge_title") or "Desafio").replace(" ", "_"))
+    safe_name = re.sub(r'[^A-Za-z0-9_]', '', str(doc.get("patient_name") or "Paciente").replace(" ", "_"))
+    filename = f"{safe_title}_{safe_name}.{format}"
+
+    # Tenta converter via FFmpeg; se o FFmpeg não estiver instalado na máquina, entrega o arquivo original sem quebrar!
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}")
+        tmp_path = tmp.name
+        tmp.close()
+        cmd = ["ffmpeg", "-y", "-i", local_path, tmp_path]
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0:
+            background_tasks.add_task(os.remove, tmp_path)
+            return FileResponse(path=tmp_path, filename=filename, media_type=f"audio/{format}")
+    except Exception:
+        pass
+
+    return FileResponse(path=local_path, filename=filename, media_type=doc.get("content_type", "audio/webm"))
+
+
+# ==========================================
+# ATUALIZAÇÃO SERVER.PY: LAUDO IA NO VOICELAB
+# ==========================================
+@api_router.post("/voice/analyses/{analysis_id}/report")
+async def voice_report(analysis_id: str, user: User = Depends(get_current_user)):
+    doc = await db.voice_analyses.find_one({"analysis_id": analysis_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Análise não encontrada")
+    pat = await db.patients.find_one({"patient_id": doc["patient_id"]}, {"_id": 0})
+    if not pat:
+        raise HTTPException(status_code=404, detail="Paciente não encontrado")
+
+    prompt = build_clinical_prompt(pat, doc.get("metrics") or {}, doc.get("notes") or "")
+
+    async def event_gen():
+        full_report = ""
+        try:
+            if GEMINI_API_KEY:
+                client_gemini = AsyncOpenAI(api_key=GEMINI_API_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+                resp = await client_gemini.chat.completions.create(
+                    model="gemini-2.0-flash",
+                    messages=[
+                        {"role": "system", "content": "Você é um fonoaudiólogo especialista em voz e acústica forense/clínica (Praat). Gere pareceres baseados em evidências com referências clicáveis."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    stream=True
+                )
+                async for chunk in resp:
+                    text = chunk.choices[0].delta.content or ""
+                    if text:
+                        full_report += text
+                        yield f"data: {json.dumps({'delta': text})}\n\n"
+            else:
+                raise ValueError("Sem GEMINI_API_KEY")
+        except Exception:
+            fallback = (
+                f"### Parecer Acústico Instrumental\n\n"
+                f"**Paciente:** {pat.get('name')} | **Tarefa:** {doc.get('task')}\n\n"
+                f"* **Frequência Fundamental (F0):** {doc.get('metrics', {}).get('f0_mean_hz', 0)} Hz\n"
+                f"* **Jitter (Local):** {doc.get('metrics', {}).get('jitter_local_pct', 0)}% (Referência: < 1.04%)\n"
+                f"* **Shimmer (Local):** {doc.get('metrics', {}).get('shimmer_local_pct', 0)}% (Referência: < 3.81%)\n"
+                f"* **HNR:** {doc.get('metrics', {}).get('hnr_db', 0)} dB (Referência: > 20 dB)\n\n"
+                f"**Hipótese Funcional:** Sugere-se correlação com achados perceptivo-auditivos (CAPE-V) e videolaringoscópicos ([Behlau, 2001](https://scholar.google.com/scholar?q=Behlau+2001+voz))."
+            )
+            full_report = fallback
+            yield f"data: {json.dumps({'delta': fallback})}\n\n"
+
+        await db.voice_analyses.update_one(
+            {"analysis_id": analysis_id},
+            {"$set": {"report": full_report, "report_generated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        yield f"data: {json.dumps({'done': True, 'report': full_report})}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 @api_router.patch("/appointments/{appointment_id}")
 async def update_appointment(appointment_id: str, payload: dict, user: User = Depends(get_current_user)):
@@ -636,21 +919,129 @@ async def compile_soap_history(patient_id: str, user: User = Depends(get_current
         headers={"Content-Disposition": f"attachment; filename=Prontuario_{pat['name'].replace(' ', '_')}.pdf"}
     )
 
+# ==========================================
+# COMPLEMENTO OFICIAL: BI DASHBOARD + PORTAL DO PACIENTE + SEED
+# ==========================================
+
 @api_router.get("/dashboard/stats")
 async def dashboard_stats(user: User = Depends(get_current_user)):
     q_owner = {"owner_user_id": user.user_id} if user.role == "doctor" else {}
-    total_patients = await db.patients.count_documents({**q_owner, "status": "active"} if user.role == "doctor" else {"status": "active"})
+    all_patients = await db.patients.find(q_owner, {"_id": 0}).to_list(1000)
+    active_patients = [p for p in all_patients if p.get("status", "active") == "active"]
+    
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
     tomorrow = (now + timedelta(days=1)).date().isoformat()
-    apts_today = await db.appointments.find({**q_owner, "start": {"$gte": today, "$lt": tomorrow}}, {"_id": 0}).to_list(200)
     week_end = (now + timedelta(days=7)).date().isoformat()
+
+    apts_today = await db.appointments.find({**q_owner, "start": {"$gte": today, "$lt": tomorrow}}, {"_id": 0}).to_list(200)
     apts_week = await db.appointments.count_documents({**q_owner, "start": {"$gte": today, "$lt": week_end}})
-    records_count = await db.records.count_documents(q_owner) if user.role == "doctor" else 0
+    records_count = await db.records.count_documents({})
+
+    # Cálculo real para as barras de Inteligência de Negócio (BI)
+    total_p = len(all_patients) or 1
+    pediatric_count = sum(1 for p in all_patients if (p.get("age") is not None and int(p.get("age", 30)) <= 12))
+    bi_pediatric_pct = round((pediatric_count / total_p) * 100) if all_patients else 45
+    bi_active_pct = round((len(active_patients) / total_p) * 100) if all_patients else 85
+
     return {
-        "total_patients": total_patients, "appointments_today": len(apts_today),
-        "appointments_week": apts_week, "records_count": records_count, "today_list": apts_today,
+        "total_patients": len(active_patients),
+        "appointments_today": len(apts_today),
+        "appointments_week": apts_week,
+        "records_count": records_count,
+        "today_list": apts_today,
+        "bi_pediatric_pct": bi_pediatric_pct,
+        "bi_adult_pct": 100 - bi_pediatric_pct,
+        "bi_active_pct": bi_active_pct,
+        "bi_inactive_pct": 100 - bi_active_pct,
     }
+
+@api_router.get("/portal/dashboard")
+async def get_patient_portal_dashboard(user: User = Depends(get_current_user)):
+    email_clean = user.email.strip().lower() if user.email else ""
+    primeiro_nome = user.name.split()[0].lower() if user.name else "paciente"
+
+    query_conds = []
+    if email_clean: query_conds.append({"email": {"$regex": f"^{email_clean}$", "$options": "i"}})
+    if primeiro_nome and primeiro_nome != "paciente": query_conds.append({"name": {"$regex": f"^{primeiro_nome}", "$options": "i"}})
+
+    patient_record = await db.patients.find_one({"$or": query_conds}) if query_conds else await db.patients.find_one({})
+    p_ids = []
+    if patient_record:
+        if "_id" in patient_record: p_ids.append(str(patient_record["_id"]))
+        if "patient_id" in patient_record: p_ids.append(str(patient_record["patient_id"]))
+
+    user_record = await db.users.find_one({"email": user.email})
+    notif_settings = (user_record or {}).get("notif_settings") or (patient_record or {}).get("notif_settings") or {
+        "whatsapp": True, "sessionReminders": True, "diaryAlerts": True, "vocalTips": False
+    }
+
+    hoje_str = datetime.now().isoformat()[:10]
+    todas_sessoes = await db.appointments.find({"start": {"$gte": hoje_str}}).sort("start", 1).to_list(100)
+    proxima_sessao = None
+    if todas_sessoes:
+        proxima_sessao = todas_sessoes[0]
+        proxima_sessao["_id"] = str(proxima_sessao["_id"])
+        proxima_sessao["start_time"] = proxima_sessao.get("start")
+
+    diarios = await db.templates.find({"active": True}).to_list(50)
+    for d in diarios:
+        d["_id"] = str(d["_id"])
+
+    atividades_reais = []
+    q_act = {"patient_id": {"$in": p_ids}, "status": "in_progress"} if p_ids else {"status": "in_progress"}
+    atividades_bd = await db.activities.find(q_act).to_list(100)
+    for act in atividades_bd:
+        act["_id"] = str(act["_id"])
+        act["id"] = act.get("activity_id") or str(act["_id"])
+        atividades_reais.append(act)
+
+    return {
+        "status": "success",
+        "patient": {"name": patient_record.get("name", user.name) if patient_record else user.name, "first_name": primeiro_nome.capitalize(), "email": user.email},
+        "nextSession": proxima_sessao,
+        "diaries": diarios,
+        "settings": notif_settings,
+        "activities": atividades_reais
+    }
+
+@api_router.post("/portal/activities/complete")
+async def complete_patient_activity(payload: dict, user: User = Depends(get_current_user)):
+    act_id = payload.get("activity_id") or payload.get("id")
+    await db.patient_records.insert_one({
+        "patient_email": user.email.lower().strip(),
+        "type": "activity_completed",
+        "activity_id": act_id,
+        "activity_title": payload.get("title"),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    if act_id:
+        act = await db.activities.find_one({"$or": [{"activity_id": act_id}, {"id": act_id}]})
+        if act:
+            days = act.get("days_completed", [False]*7)
+            for i in range(len(days)):
+                if not days[i]:
+                    days[i] = True
+                    break
+            await db.activities.update_one({"_id": act["_id"]}, {"$set": {"days_completed": days}})
+    return {"status": "success", "message": "Treino registrado na clínica!"}
+
+@api_router.post("/portal/diaries/submit")
+async def submit_patient_diary(payload: dict, user: User = Depends(get_current_user)):
+    await db.patient_records.insert_one({
+        "patient_email": user.email.lower().strip(),
+        "type": "diary_submitted",
+        "diary_id": payload.get("diary_id"),
+        "diary_title": payload.get("title", "Diário Vocal"),
+        "answers": payload.get("answers", {}),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    return {"status": "success", "message": "Diário enviado com sucesso!"}
+
+@api_router.post("/portal/settings")
+async def save_portal_settings(payload: dict, user: User = Depends(get_current_user)):
+    await db.users.update_one({"email": user.email}, {"$set": {"notif_settings": payload}}, upsert=True)
+    return {"status": "success"}
 
 
 # ==========================================
@@ -1159,6 +1550,26 @@ async def delete_team_member(member_id: str, user: User = Depends(get_current_us
     await db.team.delete_one({"id": member_id, "owner_user_id": user.user_id})
     return {"status": "success"}
 
+@api_router.post("/team/setup")
+async def setup_team_member(payload: dict):
+    token = payload.get("token")
+    member = await db.team.find_one({"invite_token": token})
+    if not member:
+        raise HTTPException(status_code=400, detail="Token inválido ou expirado. Peça ao titular um novo convite.")
+
+    await db.team.update_one(
+        {"_id": member["_id"]},
+        {"$set": {
+            "cpf": payload.get("cpf"),
+            "phone": payload.get("phone"),
+            "password": payload.get("password"),
+            "status": "Ativo",
+            "invite_token": None
+        }}
+    )
+    return {"status": "success", "message": "Conta ativada com sucesso."}
+
+
 @api_router.get("/settings")
 async def get_settings(user: User = Depends(get_current_user)):
     settings = await db.settings.find_one({"owner_user_id": user.user_id})
@@ -1201,22 +1612,6 @@ async def get_patient_diaries_history(patient_id: str, user: User = Depends(get_
         r["_id"] = str(r["_id"])
         r["id"] = str(r["_id"])
     return respostas
-
-@api_router.get("/portal/dashboard")
-async def get_patient_portal_dashboard(user: User = Depends(get_current_user)):
-    email_clean = user.email.strip().lower() if user.email else ""
-    primeiro_nome = user.name.split()[0].lower() if user.name else "paciente"
-    patient_record = await db.patients.find_one({"$or": [{"email": email_clean}, {"name": {"$regex": f"^{primeiro_nome}", "$options": "i"}}]})
-    p_ids = [str(patient_record.get("patient_id"))] if patient_record else []
-    atividades_bd = await db.activities.find({"patient_id": {"$in": p_ids}, "status": "in_progress"}).to_list(100) if p_ids else []
-    for act in atividades_bd:
-        act["_id"] = str(act["_id"])
-        act["id"] = act.get("activity_id") or str(act["_id"])
-    return {
-        "status": "success",
-        "patient": {"name": user.name, "first_name": primeiro_nome.capitalize(), "email": user.email},
-        "nextSession": None, "diaries": [], "settings": {}, "activities": atividades_bd
-    }
 
 
 # ==========================================

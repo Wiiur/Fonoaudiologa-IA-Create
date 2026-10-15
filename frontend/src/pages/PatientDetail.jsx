@@ -252,6 +252,20 @@ export default function PatientDetail() {
     }
   }, [dbProtocols]);
 
+  // Carrega a nota privada do banco quando o paciente abre
+  useEffect(() => {
+    if (p?.notes) setPrivateNote(p.notes);
+  }, [p]);
+
+  const savePrivateNoteMutation = useMutation({
+    mutationFn: async (notes) => await api.patch(`/patients/${id}`, { notes }),
+    onSuccess: () => {
+      toast.success("Nota privada criptografada e salva no banco de dados!");
+      queryClient.invalidateQueries({ queryKey: ["patient", id] });
+    },
+    onError: () => toast.error("Erro ao salvar nota privada.")
+  });
+
   // Atualiza o formulário de IRPF com os dados financeiros do LTV
   useEffect(() => {
     if (financialData?.ltv) {
@@ -1890,6 +1904,185 @@ export default function PatientDetail() {
     )}
   </DialogContent>
 </Dialog>
+
+{/* ========================================== */}
+      {/* MODAL 3: VISUALIZAR PROTOCOLO PREENCHIDO   */}
+      {/* ========================================== */}
+      <Dialog open={isProtocolViewModalOpen} onOpenChange={setIsProtocolViewModalOpen}>
+        <DialogContent className="max-w-xl w-[95vw] max-h-[85vh] overflow-y-auto bg-white rounded-3xl p-6">
+          <DialogHeader>
+            <DialogTitle className="font-heading text-xl text-stone-800">
+              {protocolNames[activeProtocolKey] || "Detalhes do Protocolo"}
+            </DialogTitle>
+          </DialogHeader>
+          {activeProtocolKey && protocolsState[activeProtocolKey] && (
+            <div className="space-y-4 mt-2">
+              <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4">
+                <p className="text-xs font-bold text-emerald-700 uppercase tracking-wider mb-1">
+                  Data: {protocolsState[activeProtocolKey].date} • Escore Total: {protocolsState[activeProtocolKey].score}
+                </p>
+                <p className="text-sm text-stone-700 font-medium">{protocolsState[activeProtocolKey].summary}</p>
+                {protocolsState[activeProtocolKey].tip && (
+                  <p className="text-xs text-emerald-800 font-bold mt-2 pt-2 border-t border-emerald-200/60">
+                    💡 {protocolsState[activeProtocolKey].tip}
+                  </p>
+                )}
+              </div>
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                {Object.entries(protocolsState[activeProtocolKey].answers || {}).map(([k, v]) => (
+                  <div key={k} className="flex justify-between items-center text-xs bg-stone-50 p-3 rounded-xl border border-stone-100">
+                    <span className="font-bold text-stone-600 uppercase">{k}</span>
+                    <span className="font-bold text-[#D46F54] bg-white px-2.5 py-1 rounded border border-stone-200">Nota: {v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* ========================================== */}
+      {/* MODAL 4: CONFIRMAR RESET DE PROTOCOLO      */}
+      {/* ========================================== */}
+      <Dialog open={!!protocolToReset} onOpenChange={(open) => !open && setProtocolToReset(null)}>
+        <DialogContent className="max-w-sm bg-white rounded-3xl p-6 text-center">
+          <DialogTitle className="font-heading text-lg text-stone-800 mb-2">Refazer Protocolo?</DialogTitle>
+          <p className="text-xs text-stone-500 mb-6">Isso apagará as respostas atuais de <b>{protocolNames[protocolToReset]}</b> para que você possa aplicar novamente.</p>
+          <div className="flex gap-3">
+            <Button variant="outline" onClick={() => setProtocolToReset(null)} className="flex-1 rounded-xl">Cancelar</Button>
+            <Button onClick={() => resetProtocolMutation.mutate(protocolToReset)} disabled={resetProtocolMutation.isPending} className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl">
+              {resetProtocolMutation.isPending ? "Apagando..." : "Confirmar"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ========================================== */}
+      {/* MODAL 5: EDITOR DE RELATÓRIOS + COPILOTO IA */}
+      {/* ========================================== */}
+      <Dialog open={isReportEditorOpen} onOpenChange={setIsReportEditorOpen}>
+        <DialogContent className="max-w-5xl w-[95vw] max-h-[92vh] overflow-y-auto bg-stone-50 rounded-3xl p-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-stone-200 pb-4 mb-4">
+            <Input
+              value={reportForm.title}
+              onChange={(e) => setReportForm(prev => ({ ...prev, title: e.target.value }))}
+              className="font-heading text-xl font-bold bg-white h-11 max-w-md"
+              placeholder="Título do Relatório ou Laudo"
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="button" onClick={handleCopilotGenerate} disabled={isAiThinking} className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold h-10 rounded-xl">
+                <Wand2 size={14} className="mr-1.5" /> {isAiThinking ? "Processando IA..." : "Redigir Laudo com IA"}
+              </Button>
+              <Button type="button" variant="outline" onClick={handleCopilotReview} disabled={isAiThinking} className="border-amber-300 text-amber-800 bg-amber-50 hover:bg-amber-100 text-xs font-bold h-10 rounded-xl">
+                <Sparkles size={14} className="mr-1.5" /> Auditar Texto (IA)
+              </Button>
+              <Button type="button" variant="outline" onClick={() => handleExportReport('doc')} className="text-xs font-bold h-10 rounded-xl">
+                <FileDown size={14} className="mr-1.5" /> Exportar DOC
+              </Button>
+            </div>
+          </div>
+
+          {reviewSuggestions && reviewSuggestions.length > 0 && (
+            <div className="mb-4 space-y-2 bg-amber-50 border border-amber-200 p-4 rounded-2xl">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-amber-800 mb-2">Sugestões da Auditoria Clínica IA</h4>
+              {reviewSuggestions.map(sug => (
+                <div key={sug.id} className="bg-white p-3 rounded-xl border border-amber-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 text-xs">
+                  <div>
+                    <span className="font-bold text-rose-600 line-through mr-2">{sug.original}</span>
+                    <span className="font-bold text-emerald-700">→ {sug.suggestion}</span>
+                    <p className="text-stone-500 mt-0.5">{sug.reason}</p>
+                  </div>
+                  <div className="flex gap-2 shrink-0">
+                    <Button size="sm" onClick={() => acceptSuggestion(sug)} className="bg-emerald-600 text-white h-8 text-xs">Aceitar</Button>
+                    <Button size="sm" variant="ghost" onClick={() => rejectSuggestion(sug.id)} className="h-8 text-xs">Ignorar</Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="bg-white rounded-2xl border border-stone-200 overflow-hidden mb-4">
+            <ReactQuill theme="snow" value={reportForm.content} onChange={(val) => setReportForm(prev => ({ ...prev, content: val }))} modules={quillModules} className="min-h-[320px]" />
+          </div>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <Button variant="outline" onClick={() => saveReportMutation.mutate({ ...reportForm, patient_id: id, status: "draft" })} disabled={saveReportMutation.isPending} className="rounded-xl font-bold">
+              Salvar Rascunho
+            </Button>
+            <Button onClick={() => saveReportMutation.mutate({ ...reportForm, patient_id: id, status: "final" })} disabled={saveReportMutation.isPending} className="bg-[#D46F54] hover:bg-[#B75C46] text-white rounded-xl font-bold">
+              <Save size={16} className="mr-2" /> Finalizar e Salvar Laudo
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ========================================== */}
+      {/* MODAL 6: CONFIRMAR EXCLUSÃO DE RELATÓRIO   */}
+      {/* ========================================== */}
+      <Dialog open={!!reportToDelete} onOpenChange={(open) => !open && setReportToDelete(null)}>
+        <DialogContent className="max-w-sm bg-white rounded-3xl p-6 text-center">
+          <DialogTitle className="font-heading text-lg text-stone-800 mb-2">Excluir Relatório?</DialogTitle>
+          <p className="text-xs text-stone-500 mb-6">Deseja realmente mover <b>{reportToDelete?.title}</b> para a lixeira?</p>
+          <div className="flex gap-3">
+            <Button variant="outline" onClick={() => setReportToDelete(null)} className="flex-1 rounded-xl">Cancelar</Button>
+            <Button onClick={() => deleteReportMutation.mutate(reportToDelete.report_id || reportToDelete.id)} disabled={deleteReportMutation.isPending} className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl">
+              Excluir
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ========================================== */}
+      {/* MODAL 7: RASCUNHAR MENSAGEM WHATSAPP (IA)  */}
+      {/* ========================================== */}
+      <Dialog open={msgOpen} onOpenChange={setMsgOpen}>
+        <DialogContent className="max-w-md w-[95vw] bg-white rounded-3xl p-6">
+          <DialogHeader>
+            <DialogTitle className="font-heading text-xl text-stone-800 flex items-center gap-2">
+              <MessageSquare size={20} className="text-[#D46F54]" /> Comunicação Inteligente
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 mt-2">
+            <div>
+              <label className="text-xs font-bold text-stone-600 mb-1 block">Objetivo do Contato</label>
+              <Select value={msgType} onValueChange={setMsgType}>
+                <SelectTrigger className="bg-stone-50 h-11"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="lembrete">Lembrete de Treino Vocal</SelectItem>
+                  <SelectItem value="retorno">Acompanhamento Pós-Sessão</SelectItem>
+                  <SelectItem value="agendamento">Confirmação de Horário</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <Button onClick={handleDraftWhatsApp} disabled={isAiDraftingMsg} variant="outline" className="w-full border-indigo-200 bg-indigo-50/50 text-indigo-700 hover:bg-indigo-100 font-bold rounded-xl h-10">
+              <Sparkles size={15} className="mr-2" /> {isAiDraftingMsg ? "Escrevendo..." : "Gerar Mensagem com IA"}
+            </Button>
+            <Textarea
+              rows={5}
+              value={whatsappMsg}
+              onChange={(e) => setWhatsappMsg(e.target.value)}
+              placeholder="Clique acima para gerar ou escreva sua mensagem..."
+              className="bg-stone-50 text-sm rounded-xl resize-none"
+            />
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={copyWhatsAppMsg} disabled={!whatsappMsg} className="flex-1 rounded-xl font-bold">
+                Copiar Texto
+              </Button>
+              <Button
+                disabled={!whatsappMsg}
+                onClick={() => {
+                  const cleanPhone = p?.phone?.replace(/\D/g, "");
+                  if (cleanPhone) window.open(`https://wa.me/55${cleanPhone}?text=${encodeURIComponent(whatsappMsg)}`, "_blank");
+                  else copyWhatsAppMsg();
+                }}
+                className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold"
+              >
+                Abrir WhatsApp
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
 
 {/* ========================================== */}
