@@ -9,6 +9,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import FinancialVault from "./FinancialVault";
+import AuditLogsPanel from "@/components/AuditLogsPanel";
 
 // Importação de Ícones
 import { 
@@ -232,6 +233,7 @@ export default function SettingsPage() {
           { id: "team", label: "Equipe & Secretárias", icon: Users },
           { id: "templates", label: "Diários & Modelos", icon: BookHeart },
           { id: "finance", label: "Cofre & Recebimentos", icon: Lock }, // <--- NOVA ABA AQUI
+          { id: "audit", label: "Histórico de Atividades", icon: Activity } // <--- NOVA ABA AQUI
         ].map((tab) => (
           <button 
             key={tab.id} onClick={() => setActiveTab(tab.id)} 
@@ -667,6 +669,14 @@ export default function SettingsPage() {
         {activeTab === "finance" && (
           <div className="animate-in fade-in slide-in-from-bottom-4">
              <FinancialVault />
+          </div>
+        )}
+        {/* ========================================== */}
+        {/* ABA 6: HISTÓRICO DE ATIVIDADES (AUDIT LOGS) */}
+        {/* ========================================== */}
+        {activeTab === "audit" && (
+          <div className="animate-in fade-in slide-in-from-bottom-4">
+             <AuditLogsPanel />
           </div>
         )}
 
